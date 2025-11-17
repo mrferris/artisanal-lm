@@ -14,7 +14,7 @@ import wandb
 from lm.model import transformer
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
-from lm.training.loss.cross_entropy import cross_entropy_masked
+from lm.training.loss.cross_entropy import cross_entropy
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import save_checkpoint
 from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
@@ -68,6 +68,9 @@ def train(config: TrainingConfig):
     if config.compile:
         model = torch.compile(model)
 
+    if config.device == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     model.to(config.device)
 
     optimizer = AdamW(
@@ -78,14 +81,14 @@ def train(config: TrainingConfig):
         eps=config.eps,
     )
 
-    training_data_loader = ConversationBatchLoader(
+    training_data_loader = BatchLoader(
         file_path=config.training_data_path,
         batch_size=config.batch_size,
         context_length=config.context_length,
         device=config.device,
     )
 
-    validation_batch_loader = ConversationBatchLoader(
+    validation_batch_loader = BatchLoader(
         file_path=config.validation_data_path,
         batch_size=config.batch_size,
         context_length=config.context_length,
@@ -129,13 +132,12 @@ def train(config: TrainingConfig):
 
         # Get a batch of data using the data loader
 
-        train, label, lengths = training_data_loader.load_batch()
+        train, label = training_data_loader.load_batch()
         output = model(train)
-        loss = cross_entropy_masked(output, label, train, lengths, me_token_id=1, them_token_id=2)
+        loss = cross_entropy(output, label)
 
         sequence = train[0]
         token_list = sequence.tolist()
-        print(f"Data length: {lengths[0]}")
         print(f"Data: {tokenizer.decode(token_list)}")
 
         # Backpropogate and calculate gradients.
@@ -213,10 +215,10 @@ class BatchLoader:
 
 
 def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
-    validation_data, validation_label, lengths = loader.load_batch()
+    validation_data, validation_label = loader.load_batch()
     validation_output = model(validation_data)
 
-    validation_loss = cross_entropy_masked(validation_output, validation_label, validation_data, lengths, me_token_id=1, them_token_id=2)
+    validation_loss = cross_entropy(validation_output, validation_label)
 
     return validation_loss
 
