@@ -12,7 +12,7 @@ def synchronize_accelerator(device: str):
         torch.cuda.synchronize()
 
 
-def estimate_mfu(num_params: int, model: torch.nn.Module, dt: float) -> float:
+def estimate_mfu(num_params: int, batch_size: int, model: torch.nn.Module, dt: float) -> float:
     """
     Calculates Model Flops Utilization
     Flops per token: 6*N + 12*L*H*Q*T
@@ -23,7 +23,7 @@ def estimate_mfu(num_params: int, model: torch.nn.Module, dt: float) -> float:
     head_dim = model.d_model // num_heads
     seq_len = model.context_length
     flops_actual = (num_params * 6) + (12 * num_layers * num_heads * head_dim * seq_len)
-    flops_actual *= model.batch_size
+    flops_actual *= batch_size
     flops_actual = flops_actual / dt
 
     expected_h100_flops = {torch.bfloat16: 1979e12, torch.float32: 67e12}

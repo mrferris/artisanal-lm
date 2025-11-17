@@ -154,7 +154,7 @@ def train(config: TrainingConfig):
             dt = t1 - t0
             t0 = t1
 
-            mfu = estimate_mfu(num_params=param_counts[1], model=model, dt=dt)
+            mfu = estimate_mfu(num_params=param_counts[1], batch_size=config.batch_size, model=model, dt=dt)
 
         tensorboard_writer.add_scalar("Loss-2/train", loss.item(), step)
 

@@ -49,6 +49,7 @@ class TransformerLM(nn.Module):
     ):
         super().__init__()
 
+        self.d_model = d_model
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.num_layers = num_layers
