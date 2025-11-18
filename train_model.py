@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import wandb
 from lm.model import transformer
+from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
 from lm.training.loss.cross_entropy import cross_entropy
@@ -43,27 +44,44 @@ class TrainingConfig:
 
     checkpoint_interval: int
     validation_interval: int
+    mfu_interval: int
 
     training_data_path: str
     validation_data_path: str
-    finetuning_data_path: str | None
     device: str
     dtype: torch.dtype
     compile: bool
+    train_reference: bool
+
+    disable_wandb: bool
+    disable_tensorboard: bool
+    run_name: str
 
 
 def train(config: TrainingConfig):
-    model = transformer.TransformerLM(
-        d_model=config.d_model,
-        vocab_size=config.vocab_size,
-        context_length=config.context_length,
-        num_layers=config.num_layers,
-        num_heads=config.num_heads,
-        d_ff=config.d_ff,
-        rope_theta=config.rope_theta,
-        device=config.device,
-        dtype=config.dtype,
-    )
+    if config.train_reference:
+        model = model = ReferenceTransformerLM(
+            d_model=config.d_model,
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            d_ff=config.d_ff,
+            rope_theta=config.rope_theta,
+        )
+
+    else:
+        model = transformer.TransformerLM(
+            d_model=config.d_model,
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            d_ff=config.d_ff,
+            rope_theta=config.rope_theta,
+            device=config.device,
+            dtype=config.dtype,
+        )
 
     if config.compile:
         model = torch.compile(model)
@@ -95,23 +113,14 @@ def train(config: TrainingConfig):
         device=config.device,
     )
 
-    param_counts = model.param_count()
-    config_dict = asdict(config)
-    config_dict["num_params"] = param_counts[0]
-    config_dict["non_embedding_params"] = param_counts[1]
-    wandb_handler = wandb.init(entity="michael-ferris-1928-michael-ferris", project="LLM", config=config_dict)
+    # Logged and used for MFU calculations.
+    param_count = model.param_count()[1]
 
-    current_time = datetime.now().strftime("%-m-%-d-%y_%H:%M")
-    tensorboard_writer = SummaryWriter(f"runs/experiment-{current_time}")
+    logger = TrainingLogger(config=config, param_count=param_count)
     checkpointer = Checkpointer()
-
     tokenizer = Tokenizer.from_files(vocab_filepath="data/vocab/imessages_vocab.json", merges_filepath="data/vocab/imessages_merges.pkl")
 
-    mfu_steps = 100
-
-    synchronize_accelerator(config.device)
     t0 = time.time()
-    mfu = 0.0
 
     for step in range(1, config.training_steps + 1):
         print(f"Step: {step}")
@@ -131,11 +140,11 @@ def train(config: TrainingConfig):
         print(f"Learning rate: {lr}")
 
         # Get a batch of data using the data loader
-
         train, label = training_data_loader.load_batch()
         output = model(train)
         loss = cross_entropy(output, label)
 
+        # View sample sequence
         sequence = train[0]
         token_list = sequence.tolist()
         print(f"Data: {tokenizer.decode(token_list)}")
@@ -150,32 +159,59 @@ def train(config: TrainingConfig):
         # Optimize the gradients.
         optimizer.step()
 
-        if step % mfu_steps == 0:
+        step_state = {}
+        if step % config.mfu_interval == 0:
             synchronize_accelerator(config.device)
             t1 = time.time()
             dt = t1 - t0
             t0 = t1
 
-            mfu = estimate_mfu(num_params=param_counts[1], batch_size=config.batch_size, model=model, dt=dt)
+            mfu = estimate_mfu(num_params=param_count, batch_size=config.batch_size, model=model, dt=dt)
+            step_state["mfu"] = mfu
 
-        tensorboard_writer.add_scalar("Loss-2/train", loss.item(), step)
-
-        perplexity = math.exp(loss.item())
-        wandb_handler.log({"loss": loss.item(), "perplexity": perplexity, "mfu": mfu}, step=step)
         if step % config.checkpoint_interval == 0:
             checkpointer.save_checkpoint(model, optimizer, step)
         if step % config.validation_interval == 0:
-            model.eval()
-            with torch.no_grad():
-                validation_loss = calculate_validation_loss(
-                    model=model,
-                    loader=validation_batch_loader,
-                )
-                print(f"Validation loss: {validation_loss}")
-                tensorboard_writer.add_scalar("Loss-2/valid", validation_loss.item(), step)
-                wandb_handler.log({"val_loss": validation_loss.item()}, step=step)
+            validation_loss = calculate_validation_loss(
+                model=model,
+                loader=validation_batch_loader,
+            )
+            step_state["val_loss"] = validation_loss.item()
+
+        step_state["loss"] = loss.item()
+        step_state["perplexity"] = math.exp(loss.item())
+        logger.log(step_state=step_state, step=step)
 
     return
+
+
+class TrainingLogger:
+    def __init__(self, config, param_count):
+        self.run_name = config.run_name
+        self.disable_wandb = config.disable_wandb
+        self.disable_tensorboard = config.disable_tensorboard
+
+        current_time = datetime.now().strftime("%-m-%-d-%y_%H:%M")
+        config_dict = asdict(config)
+
+        config_dict["non_embedding_params"] = param_count
+        if not self.disable_wandb:
+            self.wandb_handler = wandb.init(
+                name=f"{self.run_name}-{current_time}",
+                entity="michael-ferris-1928-michael-ferris",
+                project="Artisinal-LLM",
+                config=config_dict,
+            )
+
+        if not self.disable_tensorboard:
+            self.tensorboard_writer = SummaryWriter(f"runs/{self.run_name}-{current_time}")
+
+    def log(self, step_state, step):
+        if not self.disable_wandb:
+            self.wandb_handler.log(step_state, step=step)
+        if not self.disable_tensorboard:
+            for key, value in step_state.items():
+                self.tensorboard_writer.add_scalar(key, value, step)
 
 
 class Checkpointer:
@@ -215,12 +251,14 @@ class BatchLoader:
 
 
 def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
-    validation_data, validation_label = loader.load_batch()
-    validation_output = model(validation_data)
+    model.eval()
+    with torch.no_grad():
+        validation_data, validation_label = loader.load_batch()
+        validation_output = model(validation_data)
 
-    validation_loss = cross_entropy(validation_output, validation_label)
+        validation_loss = cross_entropy(validation_output, validation_label)
 
-    return validation_loss
+        return validation_loss
 
 
 def main():
@@ -246,13 +284,19 @@ def main():
     parser.add_argument("--validation-data-path", type=str, required=False, help="Path to validation data (.npy)")
     parser.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every n training steps")
     parser.add_argument("--validation-interval", type=int, default=100, help="Calculate validation loss every n training steps")
+    parser.add_argument("--mfu-interval", type=int, default=100, help="Interval at which to calculate MFU")
     parser.add_argument("--device", type=str, default="mps", help="Device on which to train model")
     parser.add_argument("--dtype", type=torch.dtype, default=torch.float32, help="Data type for model weights")
     parser.add_argument("--compile", dest="compile", action="store_true", help="Compile the model before training")
-    parser.add_argument("--reference-model", dest="reference_model", action="store_true", help="Train reference model")
+    parser.add_argument("--train-reference", dest="train_reference", action="store_true", help="Train reference model instead")
+    parser.add_argument("--run-name", type=str, help="Name of the training run as it will appear in WandB and Tensorboard")
+    parser.add_argument("--disable-wandb", dest="disable_wandb", action="store_true", help="Turn off W&B logging")
+    parser.add_argument("--disable-tensorboard", dest="disable_tensorboard", action="store_true", help="Turn off Tensorboard logging")
     parser.set_defaults(
-        reference_model=False,
+        train_reference=False,
         compile=False,
+        disable_wandb=False,
+        disable_tensorboard=False,
     )
 
     args = parser.parse_args()
@@ -276,12 +320,16 @@ def main():
         gradient_limit=args.gradient_limit,
         checkpoint_interval=args.checkpoint_interval,
         validation_interval=args.validation_interval,
+        mfu_interval=args.mfu_interval,
         training_data_path=args.training_data_path,
         validation_data_path=args.validation_data_path,
-        finetuning_data_path=args.finetuning_data_path,
         device=args.device,
         dtype=args.dtype,
         compile=args.compile,
+        train_reference=args.train_reference,
+        run_name=args.run_name,
+        disable_wandb=args.disable_wandb,
+        disable_tensorboard=args.disable_tensorboard,
     )
 
     print(f"Training with config: {config}")
