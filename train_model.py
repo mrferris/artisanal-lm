@@ -17,7 +17,7 @@ from lm.tokenization.bpe import Tokenizer
 from lm.training.loss.cross_entropy import cross_entropy
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import save_checkpoint
-from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
+from lm.training.utils.data_batching import load_batch
 from lm.training.utils.gradient_clipping import clip_gradients
 from lm.training.utils.scheduler import learning_rate_scheduler
 
@@ -224,34 +224,38 @@ def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
 
 
 def main():
-    arguments = argparse.ArgumentParser(description="Train LLM")
-    arguments.add_argument("--batch-size", type=int, default=128, help="Number of batches per training step")
-    arguments.add_argument("--context-length", type=int, default=256, help="length of model's context length")
-    arguments.add_argument("--d-model", type=int, default=512, help="Dimension of model's embeddings")
-    arguments.add_argument("--vocab-size", type=int, default=32_000, help="Number of tokens in the model's vocab")
-    arguments.add_argument("--num-heads", type=int, default=16, help="Heads per attention mechanism in the model")
-    arguments.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers in the model")
-    arguments.add_argument("--d-ff", type=int, default=1344, help="Dimension of the feedforward networks in the model")
-    arguments.add_argument("--rope-theta", type=int, default=10000, help="Constant used in RoPE rotation calculations")
-    arguments.add_argument("--min-learning-rate", type=float, default=3e-5, help="Slowest learning rate")
-    arguments.add_argument("--learning-rate", type=float, default=3e-4, help="Nominal learning rate")
-    arguments.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay rate for AdamW optimization")
-    arguments.add_argument("--beta1", type=float, default=0.9, help="Beta1 constant for AdamW Optimization")
-    arguments.add_argument("--beta2", type=float, default=0.95, help="Beta2 constant for AdamW Optimization")
-    arguments.add_argument("--epsilon", type=float, default=1e-5, help="Epsilon cosntant for AdamW Optimization")
-    arguments.add_argument("--training-steps", type=int, default=10_000, help="Number of training iterations to run")
-    arguments.add_argument("--warmup-steps", type=int, default=100, help="Steps before specified learning rate reached")
-    arguments.add_argument("--gradient-limit", type=int, default=1.0, help="L2 gabove which will be clipped")
-    arguments.add_argument("--training-data-path", type=str, required=True, help="Path to training data (.npy)")
-    arguments.add_argument("--validation-data-path", type=str, required=False, help="Path to validation data (.npy)")
-    arguments.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every n training steps")
-    arguments.add_argument("--validation-interval", type=int, default=100, help="Calculate validation loss every n training steps")
-    arguments.add_argument("--device", type=str, default="mps", help="Device on which to train model")
-    arguments.add_argument("--dtype", type=torch.dtype, default=torch.float32, help="Data type for model weights")
-    arguments.add_argument("--compile", type=bool, default=False, help="Compile the model before training")
-    arguments.add_argument("--finetuning-data-path", type=str, default=None, help="Datapath for finetuning data")
+    parser = argparse.ArgumentParser(description="Train LLM")
+    parser.add_argument("--batch-size", type=int, default=128, help="Number of batches per training step")
+    parser.add_argument("--context-length", type=int, default=256, help="length of model's context length")
+    parser.add_argument("--d-model", type=int, default=512, help="Dimension of model's embeddings")
+    parser.add_argument("--vocab-size", type=int, default=32_000, help="Number of tokens in the model's vocab")
+    parser.add_argument("--num-heads", type=int, default=16, help="Heads per attention mechanism in the model")
+    parser.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers in the model")
+    parser.add_argument("--d-ff", type=int, default=1344, help="Dimension of the feedforward networks in the model")
+    parser.add_argument("--rope-theta", type=int, default=10000, help="Constant used in RoPE rotation calculations")
+    parser.add_argument("--min-learning-rate", type=float, default=3e-5, help="Slowest learning rate")
+    parser.add_argument("--learning-rate", type=float, default=3e-4, help="Nominal learning rate")
+    parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay rate for AdamW optimization")
+    parser.add_argument("--beta1", type=float, default=0.9, help="Beta1 constant for AdamW Optimization")
+    parser.add_argument("--beta2", type=float, default=0.95, help="Beta2 constant for AdamW Optimization")
+    parser.add_argument("--epsilon", type=float, default=1e-5, help="Epsilon cosntant for AdamW Optimization")
+    parser.add_argument("--training-steps", type=int, default=10_000, help="Number of training iterations to run")
+    parser.add_argument("--warmup-steps", type=int, default=100, help="Steps before specified learning rate reached")
+    parser.add_argument("--gradient-limit", type=int, default=1.0, help="L2 gabove which will be clipped")
+    parser.add_argument("--training-data-path", type=str, required=True, help="Path to training data (.npy)")
+    parser.add_argument("--validation-data-path", type=str, required=False, help="Path to validation data (.npy)")
+    parser.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every n training steps")
+    parser.add_argument("--validation-interval", type=int, default=100, help="Calculate validation loss every n training steps")
+    parser.add_argument("--device", type=str, default="mps", help="Device on which to train model")
+    parser.add_argument("--dtype", type=torch.dtype, default=torch.float32, help="Data type for model weights")
+    parser.add_argument("--compile", dest="compile", action="store_true", help="Compile the model before training")
+    parser.add_argument("--reference-model", dest="reference_model", action="store_true", help="Train reference model")
+    parser.set_defaults(
+        reference_model=False,
+        compile=False,
+    )
 
-    args = arguments.parse_args()
+    args = parser.parse_args()
 
     config = TrainingConfig(
         batch_size=args.batch_size,
