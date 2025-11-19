@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import math
 import os
-from einops import rearrange, einsum
-import einx
 
+import einx
 import torch
 import torch.nn as nn
+from einops import einsum, rearrange
+from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from jaxtyping import Float, Bool, Int
-
-import torch.cuda.nvtx as nvtx
-
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +19,7 @@ def softmax(x, dim=-1):
     rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
     exponentiated_rescaled_input = torch.exp(rescaled_input)
     return exponentiated_rescaled_input / torch.sum(exponentiated_rescaled_input, dim=dim, keepdim=True)
+
 
 class Linear(nn.Module):
     def __init__(self, d_in: int, d_out: int):
@@ -34,17 +31,17 @@ class Linear(nn.Module):
             d_out: int
                 The number of output features.
         """
-        
+
         super().__init__()
         std = math.sqrt(2 / (d_in + d_out))
         self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3*std, b=3*std),
-            requires_grad=True
+            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std),
+            requires_grad=True,
         )
 
     def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
         return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
-    
+
     def extra_repr(self):
         return f"d_out={self.weight.shape[0]}, d_in={self.weight.shape[1]}"
 
@@ -55,12 +52,12 @@ class Embedding(nn.Module):
         std = 1.0
         self.weight = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std),
-            requires_grad=True
+            requires_grad=True,
         )
-    
+
     def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
         return self.weight[token_ids, :]
-    
+
     def extra_repr(self):
         return f"vocab_size={self.weight.shape[0]}, d={self.weight.shape[1]}"
 
@@ -110,7 +107,7 @@ class RMSNorm(nn.Module):
         x = x * rms
 
         return (self.weight * x).to(in_dtype)
-    
+
     def extra_repr(self):
         return f"hidden_size={self.weight.shape[0]}, eps={self.eps}"
 
@@ -120,15 +117,16 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.register_buffer(
             "_freq_cis_cache",
-            RotaryEmbedding._init_cache(context_length, dim, theta), persistent=False
+            RotaryEmbedding._init_cache(context_length, dim, theta),
+            persistent=False,
         )
-    
+
     @staticmethod
     def _init_cache(context_length: int, dim: int, theta: float) -> Float[Tensor, " 2 context_length half_dim"]:
         assert dim % 2 == 0
 
         d = torch.arange(0, dim, 2) / dim
-        freqs = theta ** -d
+        freqs = theta**-d
         t = torch.arange(context_length)
 
         freqs = einsum(t, freqs, "t, f -> t f")
@@ -137,20 +135,20 @@ class RotaryEmbedding(nn.Module):
         return torch.stack((cos, sin))
 
     def forward(self, x: Float[Tensor, " ... seq d"], pos_ids: Int[Tensor, " ... seq"]) -> Float[Tensor, " ... seq d"]:
-        x1, x2 = rearrange(x, '... (half_d xy) -> xy ... half_d', xy=2)
+        x1, x2 = rearrange(x, "... (half_d xy) -> xy ... half_d", xy=2)
 
         # Standard
         # cos, sin = self._freq_cis_cache[:, pos_ids, :]
 
         # einx
-        cos, sin = einx.get_at('cos_sin [pos] half_dim, ... -> cos_sin ... half_dim', self._freq_cis_cache, pos_ids)
+        cos, sin = einx.get_at("cos_sin [pos] half_dim, ... -> cos_sin ... half_dim", self._freq_cis_cache, pos_ids)
 
         # 2D rotation matrix applied to pairs in x
         x1_rot = cos * x1 - sin * x2
         x2_rot = sin * x1 + cos * x2
-        result = einx.rearrange('... x_half, ... x_half -> ... (x_half (1 + 1))', x1_rot, x2_rot).contiguous()
+        result = einx.rearrange("... x_half, ... x_half -> ... (x_half (1 + 1))", x1_rot, x2_rot).contiguous()
         return result
-    
+
     def extra_repr(self):
         return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
 
@@ -189,21 +187,26 @@ class BasicsTransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
     ):
         # Store the model configuration for serialization / deserialization
-        self.config = {
-            k: v for k, v in locals().items() if k != "self" and not (k.startswith("__") and k.endswith("__"))
-        }
+        self.config = {k: v for k, v in locals().items() if k != "self" and not (k.startswith("__") and k.endswith("__"))}
         super().__init__()
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model
         self.token_embeddings = Embedding(vocab_size, d_model)
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.device = device
+        self.dtype = dtype
+
         d_head = d_model // num_heads
         self.positional_encoder = RotaryEmbedding(
             context_length=context_length,
             dim=d_head,
-            theta=rope_theta
+            theta=rope_theta,
         )
         self.layers = nn.ModuleList(
             [
@@ -214,7 +217,7 @@ class BasicsTransformerLM(nn.Module):
                     positional_encoder=self.positional_encoder,
                 )
                 for _ in range(num_layers)
-            ]
+            ],
         )
         self.ln_final = RMSNorm(d_model)
         self.lm_head = Linear(d_model, vocab_size)
@@ -299,7 +302,7 @@ class BasicsTransformerLM(nn.Module):
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
-            
+
         original_sequence_length = x.size(-1)
         for _ in range(max_new_tokens):
             # Take the last `context_length` tokens if the input is
@@ -406,8 +409,6 @@ class TransformerBlock(nn.Module):
         ffn_sublayer_output = attn_sublayer_output + x_ffn
         return ffn_sublayer_output
 
-    
-
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
@@ -419,7 +420,7 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.w2(silu(self.w1(x)) * self.w3(x))
 
-@nvtx.range("scaled dotproduct attention")
+
 def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys    d_k"],
@@ -445,17 +446,15 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    with nvtx.range("computing attention scores"):
-        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
-        if mask is not None:
-            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
-    with nvtx.range("computing softamx"):
-        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    if mask is not None:
+        attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    with nvtx.range("final matmul"):
-        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
     return output
 
 
@@ -535,8 +534,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         # Construct causal mask
         seq = torch.arange(sequence_length, device=x.device)
-        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+        qi = einx.rearrange("query -> b... 1 query 1", seq, b=[1] * len(b))
+        kj = einx.rearrange("key   -> b... 1 1   key", seq, b=[1] * len(b))
         causal_mask = qi >= kj  # (query, key)
 
         # Shape: (..., num_heads, sequence_length, d_k)
@@ -549,6 +548,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         # Apply the output projection
         output = self.output_proj(attn_output)
         return output
+
 
 def silu(x: torch.Tensor):
     return x * torch.sigmoid(x)

@@ -68,6 +68,8 @@ def train(config: TrainingConfig):
             num_heads=config.num_heads,
             d_ff=config.d_ff,
             rope_theta=config.rope_theta,
+            device=config.device,
+            dtype=config.dtype,
         )
 
     else:
