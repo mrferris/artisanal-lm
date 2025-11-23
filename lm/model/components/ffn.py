@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float
 
-from lm.model.linear import Linear
+from lm.model.components.linear import Linear
 
 
 class SwiGLU(nn.Module):

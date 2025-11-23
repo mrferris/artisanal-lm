@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import torch
 from reference.model import BasicsTransformerLM as ReferenceTransformerLM
 
-from lm.model.attention import MultiHeadSelfAttention, Rope
-from lm.model.transformer import TransformerLM
+from lm.model.components.attention import MultiHeadSelfAttention, Rope
+from lm.model.components.transformer import TransformerLM
 from lm.performance.utils import synchronize_accelerator
 from lm.training.loss.cross_entropy import cross_entropy
 from lm.training.optimization.adamw import AdamW

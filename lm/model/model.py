@@ -2,36 +2,11 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 
-from lm.model.attention import MultiHeadSelfAttention, Rope
-from lm.model.ffn import SwiGLU
-from lm.model.linear import Embedding, Linear, RMSNorm
-
-
-class Transformer(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, rope: Rope, device: torch.device, dtype: torch.dtype):
-        super().__init__()
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.rope = rope
-
-        self.device = device
-        self.dtype = dtype
-
-        self.attention_prenorm = RMSNorm(d_model=d_model, device=device, dtype=dtype)
-        self.ffn_prenorm = RMSNorm(d_model=d_model, device=device, dtype=dtype)
-
-        self.attention = MultiHeadSelfAttention(d_model=self.d_model, num_heads=self.num_heads, rope=rope, device=self.device, dtype=self.dtype)
-
-        self.ffn = SwiGLU(d_model=self.d_model, d_ff=self.d_ff, device=self.device, dtype=self.dtype)
-
-    def forward(
-        self, input: Float[torch.Tensor, "... seq_len d_model"], token_positions: Float[torch.Tensor, "... seq_len"]
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
-        attended_input = input + self.attention(self.attention_prenorm(input), token_positions)
-
-        return attended_input + self.ffn(self.ffn_prenorm(attended_input))
+from lm.model.components.attention import Rope
+from lm.model.components.linear import Embedding, Linear, RMSNorm
+from lm.model.components.transformer import Transformer
+from lm.training.reinforcement.dpo import calculate_model_logprobs
+from lm.training.utils.checkpointing import load_checkpoint
 
 
 class TransformerLM(nn.Module):
@@ -64,7 +39,7 @@ class TransformerLM(nn.Module):
         self.embedding_layer = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
 
         self.transformer_layers = nn.ModuleList(
-            [Transformer(d_model=d_model, num_heads=num_heads, d_ff=d_ff, rope=self.rope, device=device, dtype=dtype) for _ in range(num_layers)]
+            [Transformer(d_model=d_model, num_heads=num_heads, d_ff=d_ff, rope=self.rope, device=device, dtype=dtype) for _ in range(num_layers)],
         )
 
         self.output_norm = RMSNorm(d_model=d_model, device=device, dtype=dtype)
@@ -100,3 +75,9 @@ class TransformerLM(nn.Module):
         num_parameters = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
         return [num_parameters, non_embedding_parameters]
+
+    def load_checkpoint(self, checkpoint: str):
+        load_checkpoint(checkpoint, self, None)
+
+    def do_simpo_step(self, prompt, positive, negative):
+        calculate_model_logprobs(self, prompt, prompt_lengths, output)

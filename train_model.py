@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
 import wandb
-from lm.model import transformer
+from lm.model.components import transformer
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
