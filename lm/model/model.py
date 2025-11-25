@@ -10,6 +10,14 @@ from lm.training.utils.checkpointing import load_checkpoint
 
 
 class TransformerLM(nn.Module):
+    """
+    Implements an autoregressive transformer language model.
+    Architecture is most similar to Llama1/Llama2:
+    - Pre-norm via RMSNorm
+    - RoPE for position encodings
+    - SwiGLU activations in FFN
+    """
+
     def __init__(
         self,
         d_model: int,
@@ -22,6 +30,13 @@ class TransformerLM(nn.Module):
         device: torch.device,
         dtype: torch.dtype | None = None,
     ):
+        """
+        d_model: Embedding dimension of model, aka width
+        num_heads: number of heads per attention instance
+        num_layers: number of transformer layers
+        rope: shared between all transformer layers
+        d_ff: width of the feedforward networks
+        """
         super().__init__()
 
         self.d_model = d_model
@@ -34,14 +49,12 @@ class TransformerLM(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        self.transformer_layers = []
-
         self.embedding_layer = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
 
+        self.transformer_layers = []
         self.transformer_layers = nn.ModuleList(
             [Transformer(d_model=d_model, num_heads=num_heads, d_ff=d_ff, rope=self.rope, device=device, dtype=dtype) for _ in range(num_layers)],
         )
-
         self.output_norm = RMSNorm(d_model=d_model, device=device, dtype=dtype)
 
         self.output_embedding = Linear(d_model, vocab_size, device, dtype)
