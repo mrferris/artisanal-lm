@@ -107,7 +107,7 @@ class TrainableModel:
 
         self.optimizer = AdamW(
             model.parameters(),
-            lr=5e-4,
+            lr=5e-7,
             betas=[0.9, 0.95],
             eps=1e-4,
             weight_decay=0.01,
@@ -118,7 +118,7 @@ class TrainableModel:
         prompt: list[int],
         positive: list[int],
         negative: list[int],
-    ):
+    ) -> tuple[float, float]:
         """
         Executes SimPO training on a single (prompt, positive, negative) triple.
         Aligns the model to respond more like the positive response example,
@@ -170,8 +170,7 @@ class TrainableModel:
             output_length=response_length_tensor,
         )
 
-        before_probs = torch.exp(log_probs)
-        after_probs = torch.exp(after_log_probs)
+        before_probs = torch.exp(log_probs) * 100
+        after_probs = torch.exp(after_log_probs) * 100
 
-        print(f"Probabilities before: {before_probs}")
-        print(f"Probabilities after: {after_probs}")
+        return tuple((after_probs - before_probs).tolist())

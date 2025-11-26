@@ -34,8 +34,6 @@ def calculate_model_log_probs(
     masked_log_probs = gathered_log_probs * mask
     summed_log_probs = torch.sum(masked_log_probs, dim=-1)
 
-    print(torch.exp(summed_log_probs))
-
     return summed_log_probs
 
 
