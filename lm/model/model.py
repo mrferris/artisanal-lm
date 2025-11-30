@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
+from torch.nn.utils.rnn import pad_sequence
 
 from lm.model.components.attention import Rope
 from lm.model.components.linear import Embedding, Linear, RMSNorm
@@ -120,28 +121,34 @@ class TrainableModel:
         negative: list[int],
     ) -> tuple[float, float]:
         """
-        Executes SimPO training on a single (prompt, positive, negative) triple.
+        Executes SimPO training loop on a single (prompt, positive, negative) triple.
         Aligns the model to respond more like the positive response example,
         and less like the negative.
         Args:
             prompt: List of token IDs for the prompt
             positive: List of token IDs for the positive
             negative: List of token IDs for the negative
+        Returns:
+            Two floats in a tuple, representing the change in likelihood of the
+            positive and negative responses respectively.
         """
         # calculate_log_probs expects the same number of prompts in the batch dimension as responses.
         # We will stack positive on top of negative, for outputs and output lengths.
         prompt_tensor = torch.tensor(prompt, dtype=torch.int).expand(2, -1).to(self.model.device)
         prompt_length_tensor = torch.Tensor([len(prompt), len(prompt)]).to(self.model.device)
 
-        response_tensor = torch.stack(
+        # Responses can vary in length, pad with zeros.
+        response_tensor = pad_sequence(
             [
-                torch.tensor(positive, dtype=torch.int),
-                torch.tensor(negative, dtype=torch.int),
+                torch.tensor(positive, dtype=int),
+                torch.tensor(negative, dtype=int),
             ],
+            batch_first=True,
+            padding_value=0,
         ).to(self.model.device)
         response_length_tensor = torch.tensor(
             [len(positive), len(negative)],
-            dtype=torch.int,
+            dtype=int,
         ).to(self.model.device)
 
         log_probs = calculate_model_log_probs(
@@ -158,10 +165,13 @@ class TrainableModel:
             positive_length=prompt_length_tensor[0],
             negative_length=prompt_length_tensor[1],
         )
+
+        # Take the step!
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
+        # Measure the step's effects.
         after_log_probs = calculate_model_log_probs(
             self.model,
             prompt_token_sequence=prompt_tensor,
@@ -169,7 +179,6 @@ class TrainableModel:
             output_token_sequence=response_tensor,
             output_length=response_length_tensor,
         )
-
         before_probs = torch.exp(log_probs) * 100
         after_probs = torch.exp(after_log_probs) * 100
 
