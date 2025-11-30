@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
 import wandb
-from lm.model.components import transformer
+from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
@@ -25,6 +25,12 @@ from lm.training.utils.scheduler import learning_rate_scheduler
 
 @dataclass
 class TrainingConfig:
+    """
+    Defines a pre-training run.
+    Defaults defined via argparse at instantiation of TrainingConfig.
+    """
+
+    # Model configs
     batch_size: int
     context_length: int
     d_model: int
@@ -33,26 +39,36 @@ class TrainingConfig:
     num_layers: int
     d_ff: int
     rope_theta: int
-    min_learning_rate: float
-    learning_rate: float
-    weight_decay: float
+    device: str
+    dtype: torch.dtype
+
+    # AdamW configs
     betas: tuple[float]
     eps: float
+    weight_decay: float
+
+    # Training run configs
+    min_learning_rate: float
+    learning_rate: float
     training_steps: int
     warmup_steps: int
     gradient_limit: float
 
+    # How often to do certain things
     checkpoint_interval: int
     validation_interval: int
     mfu_interval: int
 
+    # Data paths
     training_data_path: str
     validation_data_path: str
-    device: str
-    dtype: torch.dtype
+
+    # Compile the model, only works on cuda
     compile: bool
+    # Whether we should use a reference transformer implementation to sanity check ours.
     train_reference: bool
 
+    # Logging configs
     disable_wandb: bool
     disable_tensorboard: bool
     run_name: str
@@ -73,7 +89,7 @@ def train(config: TrainingConfig):
         )
 
     else:
-        model = transformer.TransformerLM(
+        model = TransformerLM(
             d_model=config.d_model,
             vocab_size=config.vocab_size,
             context_length=config.context_length,
@@ -143,13 +159,9 @@ def train(config: TrainingConfig):
 
         # Get a batch of data using the data loader
         train, label = training_data_loader.load_batch()
+
         output = model(train)
         loss = cross_entropy(output, label)
-
-        # View sample sequence
-        sequence = train[0]
-        token_list = sequence.tolist()
-        print(f"Data: {tokenizer.decode(token_list)}")
 
         # Backpropogate and calculate gradients.
         optimizer.zero_grad()
