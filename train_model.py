@@ -180,7 +180,11 @@ def train(config: TrainingConfig):
             dt = t1 - t0
             t0 = t1
 
-            mfu = estimate_mfu(num_params=param_count, batch_size=config.batch_size, model=model, dt=dt)
+            token_rate = (config.batch_size * config.context_length * config.mfu_interval) / dt
+            print(f"Token rate: {token_rate}/s")
+
+            mfu = estimate_mfu(num_params=param_count, batch_size=config.batch_size, model=model, dt=dt / config.mfu_interval)
+            print(f"MFU: {mfu}")
             step_state["mfu"] = mfu
 
         if step % config.checkpoint_interval == 0:
