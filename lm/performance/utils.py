@@ -24,6 +24,7 @@ def estimate_mfu(num_params: int, batch_size: int, model: torch.nn.Module, dt: f
     seq_len = model.context_length
     flops_actual = (num_params * 6) + (12 * num_layers * num_heads * head_dim * seq_len)
     flops_actual *= batch_size
+    flops_actual *= seq_len
     flops_actual = flops_actual / dt
 
     expected_h100_flops = {torch.bfloat16: 1979e12, torch.float32: 67e12}
@@ -37,10 +38,6 @@ def estimate_mfu(num_params: int, batch_size: int, model: torch.nn.Module, dt: f
 
     flops_expected = expected_flops[device][dtype]
 
-    mfu = (flops_actual / flops_expected) * 100.0 * 100.0
-
-    print(f"Flops expected: {flops_expected:,}")
-    print(f"Flops actual:   {flops_actual:,}")
-    print(f"MFU:            {mfu}")
+    mfu = (flops_actual / flops_expected) * 100.0
 
     return mfu
