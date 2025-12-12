@@ -54,92 +54,130 @@ class ConversationBatchLoader:
         self.END_TOKEN = 0
         self.ME_TOKEN = 1
         self.THEM_TOKEN = 2
+        self.CONVERSATION_START_TOKEN = 3
 
-        # Precompute message boundaries for speed
-        self.boundaries = self._compute_boundaries()
+        # Precompute conversation chunks for speed
+        self.chunks = self._compute_chunks()
 
-    def _compute_boundaries(self) -> list[tuple[int, int]]:
+    def _compute_chunks(self) -> list[tuple[int, int]]:
         """
-        Precompute (start, end) indices of all <|Me|> and <|Them|> segments,
-        skipping <|endoftext|> boundaries.
+        Split the dataset into chunks that:
+        1. Start at <|ConversationStart|> when beginning a new conversation
+        2. Continue from previous chunk when a conversation exceeds context_length
+        3. Never split individual messages (between special tokens)
+        4. Are randomly shuffled so there's no temporal bias during training
+
+        Returns:
+            List of (start_index, length) tuples for each chunk
         """
-        boundaries = []
+        chunks = []
         i = 0
+
         while i < len(self.tokens):
+            # Skip endoftext tokens
             if self.tokens[i] == self.END_TOKEN:
                 i += 1
                 continue
-            if self.tokens[i] in (self.ME_TOKEN, self.THEM_TOKEN):
-                start = i
-                i += 1
-                while i < len(self.tokens) and self.tokens[i] not in (self.ME_TOKEN, self.THEM_TOKEN, self.END_TOKEN):
-                    i += 1
-                end = i
-                boundaries.append((start, end))
-            else:
-                i += 1
-        return boundaries
 
-    def load_batch(self) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-        """
-        Load a batch of message-aligned samples.
-        Each sequence contains as many *full messages* as will fit
-        within context_length, without splitting any.
+            # Check if this is a conversation start or a continuation point
+            if self.tokens[i] == self.CONVERSATION_START_TOKEN:
+                # Start of a new conversation
+                conversation_start = i
+                current_pos = i
 
-        Returns:
-            padded_seqs: (batch, max_len) tensor of inputs
-            padded_labels: (batch, max_len) tensor of labels
-            valid_lengths: list[int] of number of unmasked (real) tokens
-        """
-        batch_sequences = []
-        batch_labels = []
-        valid_lengths = []
+                # Collect messages until we hit another CS or endoftext
+                messages = []  # List of (start, end) for each message
 
-        chosen_segments = np.random.choice(len(self.boundaries), self.batch_size, replace=True)
-
-        for seg_idx in chosen_segments:
-            start, _ = self.boundaries[seg_idx]
-            pos = start
-            collected = []
-
-            while pos < len(self.tokens):
-                if self.tokens[pos] == self.END_TOKEN:
-                    break
-
-                if self.tokens[pos] in (self.ME_TOKEN, self.THEM_TOKEN):
-                    msg_start = pos
-                    pos += 1
-                    while pos < len(self.tokens) and self.tokens[pos] not in (self.ME_TOKEN, self.THEM_TOKEN, self.END_TOKEN):
-                        pos += 1
-                    msg_end = pos
-                    msg = self.tokens[msg_start:msg_end]
-
-                    # Stop if adding this message would overflow context_length
-                    if len(collected) + len(msg) > self.context_length:
+                while current_pos < len(self.tokens):
+                    if self.tokens[current_pos] == self.END_TOKEN:
+                        break
+                    if current_pos != conversation_start and self.tokens[current_pos] == self.CONVERSATION_START_TOKEN:
+                        # Hit the next conversation
                         break
 
-                    collected.extend(msg)
-                else:
-                    pos += 1
+                    if self.tokens[current_pos] in (self.ME_TOKEN, self.THEM_TOKEN, self.CONVERSATION_START_TOKEN):
+                        msg_start = current_pos
+                        current_pos += 1
+                        while current_pos < len(self.tokens) and self.tokens[current_pos] not in (
+                            self.ME_TOKEN,
+                            self.THEM_TOKEN,
+                            self.CONVERSATION_START_TOKEN,
+                            self.END_TOKEN,
+                        ):
+                            current_pos += 1
+                        messages.append((msg_start, current_pos))
+                    else:
+                        current_pos += 1
 
-            if not collected:
-                collected = [self.END_TOKEN]
+                # Now split messages into chunks that fit in context_length
+                chunk_start = conversation_start
+                chunk_token_count = 0
 
-            seq = torch.tensor(collected, dtype=torch.long, device=self.device)
-            label = torch.roll(seq.clone(), shifts=-1, dims=0)
+                for msg_start, msg_end in messages:
+                    msg_length = msg_end - msg_start
+
+                    if chunk_token_count + msg_length > self.context_length:
+                        # Save current chunk and start a new one
+                        if chunk_token_count > 0:
+                            chunks.append((chunk_start, chunk_token_count))
+                        chunk_start = msg_start
+                        chunk_token_count = msg_length
+                    else:
+                        chunk_token_count += msg_length
+
+                # Save the final chunk of this conversation
+                if chunk_token_count > 0:
+                    chunks.append((chunk_start, chunk_token_count))
+
+                i = current_pos
+            else:
+                i += 1
+
+        return chunks
+
+    def load_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Load a batch by randomly sampling from pre-computed conversation chunks.
+
+        Returns:
+            padded_seqs: (batch, context_length) tensor of inputs
+            padded_labels: (batch, context_length) tensor of labels
+        """
+        if len(self.chunks) == 0:
+            raise ValueError("No conversation chunks found in dataset")
+
+        # Randomly sample chunks for this batch
+        chosen_chunk_indices = np.random.choice(len(self.chunks), self.batch_size, replace=True)
+
+        batch_sequences = []
+        batch_labels = []
+
+        for chunk_idx in chosen_chunk_indices:
+            start_idx, length = self.chunks[chunk_idx]
+
+            # Extract the chunk from the token array
+            chunk_tokens = self.tokens[start_idx : start_idx + length]
+
+            # Convert to tensor
+            seq = torch.from_numpy(chunk_tokens.copy()).to(self.device, dtype=torch.long)
+
+            # Labels are shifted by 1 (predict next token)
+            label = torch.zeros_like(seq)
+            label[:-1] = seq[1:]
             label[-1] = self.END_TOKEN
 
             batch_sequences.append(seq)
             batch_labels.append(label)
-            valid_lengths.append(len(seq))  # number of unmasked tokens
 
-        max_len = max(valid_lengths)
+        # Pad sequences to the same length (the max length in this batch)
+        lengths = [len(seq) for seq in batch_sequences]
+        max_len = max(lengths)
+
         padded_seqs = torch.full((self.batch_size, max_len), self.END_TOKEN, dtype=torch.long, device=self.device)
         padded_labels = torch.full((self.batch_size, max_len), self.END_TOKEN, dtype=torch.long, device=self.device)
 
         for i, (seq, label) in enumerate(zip(batch_sequences, batch_labels)):
-            l = valid_lengths[i]
-            padded_seqs[i, :l] = seq
-            padded_labels[i, :l] = label
+            padded_seqs[i, : lengths[i]] = seq
+            padded_labels[i, : lengths[i]] = label
 
-        return padded_seqs, padded_labels, valid_lengths
+        return padded_seqs, padded_labels
