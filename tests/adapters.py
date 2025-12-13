@@ -12,7 +12,7 @@ from torch import Tensor
 from lm.model.components.attention import MultiHeadSelfAttention, Rope, scaled_dot_product_attention, softmax
 from lm.model.components.ffn import SwiGLU
 from lm.model.components.linear import Embedding, Linear, RMSNorm
-from lm.model.components.transformer import Transformer, TransformerLM
+from lm.model.model import Transformer, TransformerLM
 from lm.tokenization.bpe import Tokenizer, train_bpe
 from lm.training.loss.cross_entropy import cross_entropy
 from lm.training.optimization.adamw import AdamW
