@@ -9,6 +9,7 @@ import numpy
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import wandb
 from lm.model.model import TransformerLM
@@ -76,7 +77,7 @@ class TrainingConfig:
 
 def train(config: TrainingConfig):
     if config.train_reference:
-        model = model = ReferenceTransformerLM(
+        model = ReferenceTransformerLM(
             d_model=config.d_model,
             vocab_size=config.vocab_size,
             context_length=config.context_length,
@@ -100,6 +101,8 @@ def train(config: TrainingConfig):
             device=config.device,
             dtype=config.dtype,
         )
+        param_count = model.param_count()[1]
+        print(f"Non-embedding param count: {param_count:,}")
 
     if config.compile:
         model = torch.compile(model)
@@ -140,8 +143,8 @@ def train(config: TrainingConfig):
 
     t0 = time.time()
 
-    for step in range(1, config.training_steps + 1):
-        print(f"Step: {step}")
+    t0 = time.time()
+    for step in tqdm(range(1, config.training_steps + 1)):
         # Put the model in training mode.
         model.train()
 
