@@ -63,6 +63,8 @@ class TrainingConfig:
     # Data paths
     training_data_path: str
     validation_data_path: str
+    vocab_path: str | None
+    merges_path: str | None
 
     # Compile the model, only works on cuda
     compile: bool
@@ -139,9 +141,14 @@ def train(config: TrainingConfig):
 
     logger = TrainingLogger(config=config, param_count=param_count)
     checkpointer = Checkpointer()
-    tokenizer = Tokenizer.from_files(vocab_filepath="data/vocab/imessages_vocab.json", merges_filepath="data/vocab/imessages_merges.pkl")
 
-    t0 = time.time()
+    if config.vocab_path is not None and config.merges_path is not None:
+        tokenizer = Tokenizer.from_files(
+            vocab_filepath=config.vocab_path,
+            merges_filepath=config.merges_path,
+        )
+    else:
+        tokenizer = None
 
     t0 = time.time()
     for step in tqdm(range(1, config.training_steps + 1)):
@@ -158,10 +165,14 @@ def train(config: TrainingConfig):
         )
         optimizer.set_learning_rate(lr)
 
-        print(f"Learning rate: {lr}")
-
         # Get a batch of data using the data loader
         train, label = training_data_loader.load_batch()
+
+        # Print de-tokenized first sequence of the batch
+        if tokenizer is not None:
+            first_sequence_ids = train[0].tolist()
+            decoded_text = tokenizer.decode(first_sequence_ids)
+            tqdm.write(f"Step {step} sample: {decoded_text}")
 
         output = model(train)
         loss = cross_entropy(output, label)
@@ -313,6 +324,8 @@ def main():
     parser.add_argument("--run-name", type=str, help="Name of the training run as it will appear in WandB and Tensorboard")
     parser.add_argument("--disable-wandb", dest="disable_wandb", action="store_true", help="Turn off W&B logging")
     parser.add_argument("--disable-tensorboard", dest="disable_tensorboard", action="store_true", help="Turn off Tensorboard logging")
+    parser.add_argument("--vocab-path", type=str, default=None, help="Path to .json vocab file for example training sequences")
+    parser.add_argument("--merges-path", type=str, default=None, help="Path to .pkl merge file for example training sequences")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -344,6 +357,8 @@ def main():
         mfu_interval=args.mfu_interval,
         training_data_path=args.training_data_path,
         validation_data_path=args.validation_data_path,
+        vocab_path=args.vocab_path,
+        merges_path=args.merges_path,
         device=args.device,
         dtype=args.dtype,
         compile=args.compile,
