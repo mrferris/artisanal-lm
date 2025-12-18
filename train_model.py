@@ -16,10 +16,10 @@ from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
-from lm.training.loss.cross_entropy import cross_entropy
+from lm.training.loss.cross_entropy import cross_entropy, cross_entropy_masked
 from lm.training.optimization.adamw import AdamW
-from lm.training.utils.checkpointing import save_checkpoint
-from lm.training.utils.data_batching import load_batch
+from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
+from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
 from lm.training.utils.gradient_clipping import clip_gradients
 from lm.training.utils.scheduler import learning_rate_scheduler
 
@@ -65,6 +65,7 @@ class TrainingConfig:
     validation_data_path: str
     vocab_path: str | None
     merges_path: str | None
+    checkpoint_resume_path: str | None
 
     # Compile the model, only works on cuda
     compile: bool
@@ -141,6 +142,12 @@ def train(config: TrainingConfig):
 
     logger = TrainingLogger(config=config, param_count=param_count)
     checkpointer = Checkpointer()
+    if config.checkpoint_resume_path:
+        checkpointer.load_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=config.checkpoint_resume_path,
+        )
 
     if config.vocab_path is not None and config.merges_path is not None:
         tokenizer = Tokenizer.from_files(
@@ -202,7 +209,7 @@ def train(config: TrainingConfig):
             step_state["mfu"] = mfu
 
         if step % config.checkpoint_interval == 0:
-            checkpointer.save_checkpoint(model, optimizer, step)
+            checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
         if step % config.validation_interval == 0:
             validation_loss = calculate_validation_loss(
                 model=model,
@@ -249,20 +256,24 @@ class TrainingLogger:
 class Checkpointer:
     def __init__(self):
         self.start_time = datetime.now().strftime("%-m-%-d-%y_%H:%M")
-        os.makedirs(os.path.join("checkpoints", self.start_time), exist_ok=True)
 
     def save_checkpoint(
         self,
         model,
         optimizer,
         iteration,
+        run_name,
     ):
+        os.makedirs(os.path.join("checkpoints", f"{run_name}-{self.start_time}"), exist_ok=True)
         save_checkpoint(
             model=model,
             optimizer=optimizer,
             iteration=iteration,
-            out=os.path.join("checkpoints", self.start_time, f"checkpoint_step_{iteration}"),
+            out=os.path.join("checkpoints", f"{run_name}-{self.start_time}", f"checkpoint_step_{iteration}"),
         )
+
+    def load_checkpoint(self, model, optimizer, checkpoint_path):
+        load_checkpoint(src=checkpoint_path, model=model, optimizer=optimizer)
 
 
 class BatchLoader:
@@ -326,6 +337,7 @@ def main():
     parser.add_argument("--disable-tensorboard", dest="disable_tensorboard", action="store_true", help="Turn off Tensorboard logging")
     parser.add_argument("--vocab-path", type=str, default=None, help="Path to .json vocab file for example training sequences")
     parser.add_argument("--merges-path", type=str, default=None, help="Path to .pkl merge file for example training sequences")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path of checkpoint from which to resume training")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -359,6 +371,7 @@ def main():
         validation_data_path=args.validation_data_path,
         vocab_path=args.vocab_path,
         merges_path=args.merges_path,
+        checkpoint_resume_path=args.resume_from_checkpoint,
         device=args.device,
         dtype=args.dtype,
         compile=args.compile,
