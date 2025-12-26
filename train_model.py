@@ -2,12 +2,15 @@ import argparse
 import math
 import os
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
 import numpy
+import pandas as pd
 import torch
 import torch.nn as nn
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -22,6 +25,106 @@ from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
 from lm.training.utils.data_batching import load_batch, load_batch_sequential
 from lm.training.utils.gradient_clipping import clip_gradients
 from lm.training.utils.scheduler import learning_rate_scheduler
+
+
+class GradientBucket:
+    def __init__(self, size):
+        self.size_limit = size
+        self.members = []
+        self.is_ready = set()
+        self.current_size = 0
+
+    def launch(self) -> torch.futures.Future:
+        grads = [member.grad for member in self.members if member.grad is not None]
+        flattened = _flatten_dense_tensors(grads)
+        handle = torch.distributed.all_reduce(flattened, async_op=True)
+
+        def completion_handler(_):
+            flattened.div_(torch.distributed.get_world_size())
+            unflattened = _unflatten_dense_tensors(flattened, grads)
+
+            for grad, synced_grad in zip(grads, unflattened):
+                grad.copy_(synced_grad)
+
+        pending_handle = handle.get_future().then(completion_handler)
+        return pending_handle
+
+    def add(self, param: torch.Tensor) -> bool:
+        grad_size = param.numel() * param.element_size()
+        if not self.members or self.current_size + grad_size <= self.size_limit * 1_000_000:
+            self.current_size += grad_size
+            self.members.append(param)
+            return True
+        else:
+            return False
+
+
+class DDP:
+    def __init__(self, model: torch.nn.Module, bucket_size_mb: float):
+        self.model = model
+        self.bucket_size_mb = bucket_size_mb
+        self.handles = []
+        self.param_in_bucket = {}
+        with torch.no_grad():
+            for param in model.parameters():
+                torch.distributed.broadcast(param, src=0)
+                param.register_post_accumulate_grad_hook(lambda param: self.gradient_ready_handler(param))
+        self.buckets = []
+        self._initialize_buckets()
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def _initialize_buckets(self):
+        """
+        - build buckets of at most size self.bucket_size_mb
+        - each bucket is a dict of {param_name: str -> ready: bool}
+        """
+        bucket = GradientBucket(self.bucket_size_mb)
+
+        for param in reversed(list(self.model.parameters())):
+            if not bucket.add(param):
+                self.buckets.append(bucket)
+                bucket = GradientBucket(self.bucket_size_mb)
+                bucket.add(param)
+
+            self.param_in_bucket[param] = bucket
+
+        if bucket.members:
+            self.buckets.append(bucket)
+
+    def gradient_ready_handler(self, param: torch.Tensor):
+        bucket = self.param_in_bucket[param]
+        bucket.is_ready.add(param)
+        if len(bucket.is_ready) == len(bucket.members):
+            handle = bucket.launch()
+            self.handles.append(handle)
+
+    def finish_gradient_synchronization(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
+
+        for bucket in self.buckets:
+            bucket.is_ready.clear()
+
+    def naive_all_reduce(self):
+        for param in self.model.parameters():
+            if param.grad is not None:
+                torch.distributed.all_reduce(param.grad, async_op=False)
+                param.grad /= torch.distributed.get_world_size()
+
+    def flat_all_reduce(self):
+        tensors = [param.grad for param in self.model.parameters() if param.grad is not None]
+
+        flat_tensor = _flatten_dense_tensors(tensors)
+
+        torch.distributed.all_reduce(flat_tensor, async_op=False)
+        flat_tensor /= torch.distributed.get_world_size()
+        unflattened_tensors = _unflatten_dense_tensors(flat_tensor, tensors)
+
+        for grad, synced_grad in zip(tensors, unflattened_tensors):
+            grad.copy_(synced_grad)
 
 
 @dataclass
@@ -78,6 +181,9 @@ class TrainingConfig:
     run_name: str
 
     distributed_world_size: int
+    naive_all_reduce: bool
+    flat_all_reduce: bool
+    gradient_bucket_mb: float
 
     @property
     def distributed(self) -> bool:
@@ -107,6 +213,7 @@ def configure_rank(rank, world_size):
 
 
 def train(rank: int, config: TrainingConfig):
+    run_id = uuid.uuid4().hex[:8]
     if config.distributed:
         config.device = f"cuda:{rank}"
         configure_rank(rank=rank, world_size=config.distributed_world_size)
@@ -126,10 +233,7 @@ def train(rank: int, config: TrainingConfig):
         torch.set_float32_matmul_precision("high")
     model.to(config.device)
 
-    # Sync weights
-    if config.distributed:
-        for param in model.parameters():
-            torch.distributed.broadcast(param, src=0)
+    training_model = DDP(model, config.gradient_bucket_mb) if config.distributed else model
 
     optimizer = AdamW(
         params=model.parameters(),
@@ -139,19 +243,19 @@ def train(rank: int, config: TrainingConfig):
         eps=config.eps,
     )
 
-    training_data_loader = BatchLoader(
-        file_path=config.training_data_path,
-        batch_size=config.batch_size,
-        context_length=config.context_length,
-        device=config.device,
-    )
+    # training_data_loader = BatchLoader(
+    #     file_path=config.training_data_path,
+    #     batch_size=config.batch_size,
+    #     context_length=config.context_length,
+    #     device=config.device,
+    # )
 
-    validation_batch_loader = BatchLoader(
-        file_path=config.validation_data_path,
-        batch_size=config.batch_size,
-        context_length=config.context_length,
-        device=config.device,
-    )
+    # validation_batch_loader = BatchLoader(
+    #     file_path=config.validation_data_path,
+    #     batch_size=config.batch_size,
+    #     context_length=config.context_length,
+    #     device=config.device,
+    # )
 
     # Logged and used for MFU calculations.
     param_count = model.param_count()[1]
@@ -175,8 +279,9 @@ def train(rank: int, config: TrainingConfig):
     else:
         tokenizer = None
 
-    t0 = time.time()
-    for step in tqdm(range(1, config.training_steps + 1)):
+    t0 = time.perf_counter()
+    for step in range(1, config.training_steps + 1):
+        t_a = time.perf_counter()
         # Put the model in training mode.
         model.train()
 
@@ -192,9 +297,9 @@ def train(rank: int, config: TrainingConfig):
 
         # Get a batch of data using the data loader
         if config.distributed:
-            train, label = training_data_loader.load_batch_distributed(rank, config.distributed_world_size, step - 1)
-            train = train.to(config.device, dtype=torch.long)
-            label = label.to(config.device, dtype=torch.long)
+            data = torch.randint(config.vocab_size - 1, (config.batch_size, config.context_length + 1))
+            train = data[:, :-1].to(config.device, dtype=torch.long)
+            label = data[:, 1:].to(config.device, dtype=torch.long)
         else:
             train, label = training_data_loader.load_batch()
 
@@ -204,18 +309,32 @@ def train(rank: int, config: TrainingConfig):
             decoded_text = tokenizer.decode(first_sequence_ids)
             tqdm.write(f"Step {step} sample: {decoded_text}")
 
-        output = model(train)
+        output = training_model.forward(train)
         loss = cross_entropy(output, label)
 
         # Backpropogate and calculate gradients.
         optimizer.zero_grad()
+
+        torch.cuda.synchronize()
+        backward_before = time.perf_counter()
         loss.backward()
+        torch.cuda.synchronize()
+        backward_after = time.perf_counter()
+        backward_elapsed = backward_after - backward_before
 
         if config.distributed:
-            for param in model.parameters():
-                if param.grad is not None:
-                    torch.distributed.all_reduce(param.grad, async_op=False)
-                    param.grad /= config.distributed_world_size
+            torch.cuda.synchronize()
+            before_reduce = time.perf_counter()
+            if config.naive_all_reduce:
+                training_model.naive_all_reduce()
+            elif config.flat_all_reduce:
+                training_model.flat_all_reduce()
+            else:
+                training_model.finish_gradient_synchronization()
+            torch.cuda.synchronize()
+            after_reduce = time.perf_counter()
+            exposed = after_reduce - before_reduce
+            print(f"Rank {rank} Exposed comms: {exposed} seconds")
 
         # Clip the gradients to some max total l2 norm.
         clip_gradients(model.parameters(), config.gradient_limit)
@@ -223,11 +342,32 @@ def train(rank: int, config: TrainingConfig):
         # Optimize the gradients.
         optimizer.step()
 
-        step_state = {}
+        torch.cuda.synchronize()
+        t_b = time.perf_counter()
+        step_elapsed = t_b - t_a
+        print(f"Rank {rank} Total step time: {step_elapsed} seconds")
+        if config.distributed:
+            print(f"Rank {rank} Comms percentage: {(exposed / step_elapsed) * 100}")
+
         if rank == 0:
+            step_state = {
+                "run_id": run_id,
+                "step": step,
+                "model_size": param_count,
+                "bucket_size_mb": config.gradient_bucket_mb,
+                "step_time_ms": step_elapsed * 1000,
+                "backward_time_ms": backward_elapsed * 1000,
+                "exposed_comm_ms": exposed * 1000,
+            }
+            pd.DataFrame([step_state]).to_csv(
+                "ddp_benchmark.csv",
+                mode="a",
+                header=not os.path.exists("ddp_benchmark.csv"),
+                index=False,
+            )
             if step % config.mfu_interval == 0:
                 synchronize_accelerator(config.device)
-                t1 = time.time()
+                t1 = time.perf_counter()
                 dt = t1 - t0
                 t0 = t1
 
@@ -238,19 +378,28 @@ def train(rank: int, config: TrainingConfig):
                 print(f"MFU: {mfu}")
                 step_state["mfu"] = mfu
 
-            if step % config.checkpoint_interval == 0:
-                checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
-            if step % config.validation_interval == 0:
-                validation_loss = calculate_validation_loss(
-                    model=model,
-                    loader=validation_batch_loader,
+                pd.DataFrame([step_state]).to_csv(
+                    "ddp_benchmark.csv",
+                    mode="a",
+                    header=not os.path.exists("ddp_benchmark.csv"),
+                    index=False,
                 )
-                step_state["val_loss"] = validation_loss.item()
+
+            # if step % config.checkpoint_interval == 0:
+            #     checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
+            # if step % config.validation_interval == 0:
+            #     validation_loss = calculate_validation_loss(
+            #         model=model,
+            #         loader=validation_batch_loader,
+            #     )
+            #     step_state["val_loss"] = validation_loss.item()
 
             step_state["loss"] = loss.item()
             step_state["perplexity"] = math.exp(loss.item())
             logger.log(step_state=step_state, step=step)
 
+    if config.distributed:
+        torch.distributed.destroy_process_group()
     return
 
 
@@ -355,7 +504,7 @@ def main():
     parser.add_argument("--epsilon", type=float, default=1e-5, help="Epsilon cosntant for AdamW Optimization")
     parser.add_argument("--training-steps", type=int, default=10_000, help="Number of training iterations to run")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Steps before specified learning rate reached")
-    parser.add_argument("--gradient-limit", type=int, default=1.0, help="L2 gabove which will be clipped")
+    parser.add_argument("--gradient-limit", type=float, default=1.0, help="L2 gabove which will be clipped")
     parser.add_argument("--training-data-path", type=str, required=True, help="Path to training data (.npy)")
     parser.add_argument("--validation-data-path", type=str, required=False, help="Path to validation data (.npy)")
     parser.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every n training steps")
@@ -372,6 +521,7 @@ def main():
     parser.add_argument("--merges-path", type=str, default=None, help="Path to .pkl merge file for example training sequences")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path of checkpoint from which to resume training")
     parser.add_argument("--distributed-world-size", type=int, default=1, help="Number of devices across which to train")
+    parser.add_argument("--gradient-bucket-size", type=int, default=0, help="Size of gradient buckets on which to all reduce")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -415,6 +565,9 @@ def main():
         disable_wandb=args.disable_wandb,
         disable_tensorboard=args.disable_tensorboard,
         distributed_world_size=args.distributed_world_size,
+        naive_all_reduce=False,
+        flat_all_reduce=False,
+        gradient_bucket_mb=args.gradient_bucket_size,
     )
 
     print(f"Training with config: {config}")
@@ -427,8 +580,6 @@ def main():
         )
     else:
         train(rank=0, config=config)
-
-    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
