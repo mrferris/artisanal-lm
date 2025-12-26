@@ -16,10 +16,10 @@ from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
-from lm.training.loss.cross_entropy import cross_entropy, cross_entropy_masked
+from lm.training.loss.cross_entropy import cross_entropy
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
-from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
+from lm.training.utils.data_batching import load_batch, load_batch_sequential
 from lm.training.utils.gradient_clipping import clip_gradients
 from lm.training.utils.scheduler import learning_rate_scheduler
 
@@ -77,43 +77,59 @@ class TrainingConfig:
     disable_tensorboard: bool
     run_name: str
 
+    distributed_world_size: int
 
-def train(config: TrainingConfig):
+    @property
+    def distributed(self) -> bool:
+        return self.distributed_world_size > 1
+
+    @property
+    def model_args(self):
+        return {
+            "d_model": self.d_model,
+            "vocab_size": self.vocab_size,
+            "context_length": self.context_length,
+            "num_layers": self.num_layers,
+            "num_heads": self.num_heads,
+            "d_ff": self.d_ff,
+            "rope_theta": self.rope_theta,
+            "device": self.device,
+            "dtype": self.dtype,
+        }
+
+
+def configure_rank(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def train(rank: int, config: TrainingConfig):
+    if config.distributed:
+        config.device = f"cuda:{rank}"
+        configure_rank(rank=rank, world_size=config.distributed_world_size)
+
+    # Instantiate and move model to device
     if config.train_reference:
         model = ReferenceTransformerLM(
-            d_model=config.d_model,
-            vocab_size=config.vocab_size,
-            context_length=config.context_length,
-            num_layers=config.num_layers,
-            num_heads=config.num_heads,
-            d_ff=config.d_ff,
-            rope_theta=config.rope_theta,
-            device=config.device,
-            dtype=config.dtype,
+            **config.model_args,
         )
-
     else:
         model = TransformerLM(
-            d_model=config.d_model,
-            vocab_size=config.vocab_size,
-            context_length=config.context_length,
-            num_layers=config.num_layers,
-            num_heads=config.num_heads,
-            d_ff=config.d_ff,
-            rope_theta=config.rope_theta,
-            device=config.device,
-            dtype=config.dtype,
+            **config.model_args,
         )
-        param_count = model.param_count()[1]
-        print(f"Non-embedding param count: {param_count:,}")
-
     if config.compile:
         model = torch.compile(model)
-
-    if config.device == "cuda":
+    if config.device.startswith("cuda"):
         torch.set_float32_matmul_precision("high")
-
     model.to(config.device)
+
+    # Sync weights
+    if config.distributed:
+        for param in model.parameters():
+            torch.distributed.broadcast(param, src=0)
 
     optimizer = AdamW(
         params=model.parameters(),
@@ -139,8 +155,10 @@ def train(config: TrainingConfig):
 
     # Logged and used for MFU calculations.
     param_count = model.param_count()[1]
+    print(f"Model param count (non-embedding): {param_count}")
 
-    logger = TrainingLogger(config=config, param_count=param_count)
+    if rank == 0:
+        logger = TrainingLogger(config=config, param_count=param_count)
     checkpointer = Checkpointer()
     if config.checkpoint_resume_path:
         checkpointer.load_checkpoint(
@@ -173,7 +191,12 @@ def train(config: TrainingConfig):
         optimizer.set_learning_rate(lr)
 
         # Get a batch of data using the data loader
-        train, label = training_data_loader.load_batch()
+        if config.distributed:
+            train, label = training_data_loader.load_batch_distributed(rank, config.distributed_world_size, step - 1)
+            train = train.to(config.device, dtype=torch.long)
+            label = label.to(config.device, dtype=torch.long)
+        else:
+            train, label = training_data_loader.load_batch()
 
         # Print de-tokenized first sequence of the batch
         if tokenizer is not None:
@@ -188,6 +211,12 @@ def train(config: TrainingConfig):
         optimizer.zero_grad()
         loss.backward()
 
+        if config.distributed:
+            for param in model.parameters():
+                if param.grad is not None:
+                    torch.distributed.all_reduce(param.grad, async_op=False)
+                    param.grad /= config.distributed_world_size
+
         # Clip the gradients to some max total l2 norm.
         clip_gradients(model.parameters(), config.gradient_limit)
 
@@ -195,31 +224,32 @@ def train(config: TrainingConfig):
         optimizer.step()
 
         step_state = {}
-        if step % config.mfu_interval == 0:
-            synchronize_accelerator(config.device)
-            t1 = time.time()
-            dt = t1 - t0
-            t0 = t1
+        if rank == 0:
+            if step % config.mfu_interval == 0:
+                synchronize_accelerator(config.device)
+                t1 = time.time()
+                dt = t1 - t0
+                t0 = t1
 
-            token_rate = (config.batch_size * config.context_length * config.mfu_interval) / dt
-            print(f"Token rate: {token_rate}/s")
+                token_rate = (config.batch_size * config.context_length * config.mfu_interval) / dt
+                print(f"Token rate: {token_rate}/s")
 
-            mfu = estimate_mfu(num_params=param_count, batch_size=config.batch_size, model=model, dt=dt / config.mfu_interval)
-            print(f"MFU: {mfu}")
-            step_state["mfu"] = mfu
+                mfu = estimate_mfu(num_params=param_count, batch_size=config.batch_size, model=model, dt=dt / config.mfu_interval)
+                print(f"MFU: {mfu}")
+                step_state["mfu"] = mfu
 
-        if step % config.checkpoint_interval == 0:
-            checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
-        if step % config.validation_interval == 0:
-            validation_loss = calculate_validation_loss(
-                model=model,
-                loader=validation_batch_loader,
-            )
-            step_state["val_loss"] = validation_loss.item()
+            if step % config.checkpoint_interval == 0:
+                checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
+            if step % config.validation_interval == 0:
+                validation_loss = calculate_validation_loss(
+                    model=model,
+                    loader=validation_batch_loader,
+                )
+                step_state["val_loss"] = validation_loss.item()
 
-        step_state["loss"] = loss.item()
-        step_state["perplexity"] = math.exp(loss.item())
-        logger.log(step_state=step_state, step=step)
+            step_state["loss"] = loss.item()
+            step_state["perplexity"] = math.exp(loss.item())
+            logger.log(step_state=step_state, step=step)
 
     return
 
@@ -292,6 +322,9 @@ class BatchLoader:
     def load_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         return load_batch(self.file, batch_size=self.batch_size, context_length=self.context_length, device=self.device)
 
+    def load_batch_distributed(self, rank: int, world_size: int, training_step: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return load_batch_sequential(self.file, rank, world_size, self.batch_size, self.context_length, training_step)
+
 
 def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
     model.eval()
@@ -338,6 +371,7 @@ def main():
     parser.add_argument("--vocab-path", type=str, default=None, help="Path to .json vocab file for example training sequences")
     parser.add_argument("--merges-path", type=str, default=None, help="Path to .pkl merge file for example training sequences")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path of checkpoint from which to resume training")
+    parser.add_argument("--distributed-world-size", type=int, default=1, help="Number of devices across which to train")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -346,6 +380,7 @@ def main():
     )
 
     args = parser.parse_args()
+    assert args.distributed_world_size > 0, "World Size must be greater than 0"
 
     config = TrainingConfig(
         batch_size=args.batch_size,
@@ -379,10 +414,21 @@ def main():
         run_name=args.run_name,
         disable_wandb=args.disable_wandb,
         disable_tensorboard=args.disable_tensorboard,
+        distributed_world_size=args.distributed_world_size,
     )
 
     print(f"Training with config: {config}")
-    train(config=config)
+    if config.distributed:
+        torch.multiprocessing.spawn(
+            train,
+            args=(config,),
+            nprocs=config.distributed_world_size,
+            join=True,
+        )
+    else:
+        train(rank=0, config=config)
+
+    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

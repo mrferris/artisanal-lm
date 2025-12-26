@@ -43,6 +43,28 @@ def load_batch(
     return (sequences, labels)
 
 
+def load_batch_sequential(
+    tokens: NDArray,
+    rank: int,
+    world_size: int,
+    batch_size: int,
+    sequence_length: int,
+    training_step: int,
+) -> tuple[
+    Int[torch.Tensor, "batch_size context_length"],
+    Int[torch.Tensor, "batch_size context_length"],
+]:
+    tokens_per_rank = batch_size * sequence_length
+    start_index = tokens_per_rank * ((world_size * training_step) + (rank))
+    end_index = start_index + tokens_per_rank + 1
+    sequences = torch.from_numpy(tokens[start_index:end_index].copy())
+
+    inputs = sequences[:-1].view(batch_size, sequence_length)
+    labels = sequences[1:].view(batch_size, sequence_length)
+
+    return inputs, labels
+
+
 class ConversationBatchLoader:
     def __init__(self, file_path: str, batch_size: int, context_length: int, device: torch.device):
         self.tokens = np.memmap(file_path, dtype=np.uint16, mode="r")
