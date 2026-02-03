@@ -16,7 +16,7 @@ from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
-from lm.training.loss.cross_entropy import cross_entropy, cross_entropy_masked
+from lm.training.loss.cross_entropy import cross_entropy_masked
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
 from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
@@ -123,14 +123,14 @@ def train(config: TrainingConfig):
         eps=config.eps,
     )
 
-    training_data_loader = BatchLoader(
+    training_data_loader = ConversationBatchLoader(
         file_path=config.training_data_path,
         batch_size=config.batch_size,
         context_length=config.context_length,
         device=config.device,
     )
 
-    validation_batch_loader = BatchLoader(
+    validation_batch_loader = ConversationBatchLoader(
         file_path=config.validation_data_path,
         batch_size=config.batch_size,
         context_length=config.context_length,
@@ -182,7 +182,7 @@ def train(config: TrainingConfig):
             tqdm.write(f"Step {step} sample: {decoded_text}")
 
         output = model(train)
-        loss = cross_entropy(output, label)
+        loss = cross_entropy_masked(output, label, train)
 
         # Backpropogate and calculate gradients.
         optimizer.zero_grad()
@@ -299,7 +299,7 @@ def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
         validation_data, validation_label = loader.load_batch()
         validation_output = model(validation_data)
 
-        validation_loss = cross_entropy(validation_output, validation_label)
+        validation_loss = cross_entropy_masked(validation_output, validation_label, validation_data)
 
         return validation_loss
 
@@ -310,8 +310,8 @@ def main():
     parser.add_argument("--context-length", type=int, default=256, help="length of model's context length")
     parser.add_argument("--d-model", type=int, default=512, help="Dimension of model's embeddings")
     parser.add_argument("--vocab-size", type=int, default=32_000, help="Number of tokens in the model's vocab")
-    parser.add_argument("--num-heads", type=int, default=16, help="Heads per attention mechanism in the model")
-    parser.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers in the model")
+    parser.add_argument("--num-heads", type=int, default=2, help="Heads per attention mechanism in the model")
+    parser.add_argument("--num-layers", type=int, default=16, help="Number of transformer layers in the model")
     parser.add_argument("--d-ff", type=int, default=1344, help="Dimension of the feedforward networks in the model")
     parser.add_argument("--rope-theta", type=int, default=10000, help="Constant used in RoPE rotation calculations")
     parser.add_argument("--min-learning-rate", type=float, default=3e-5, help="Slowest learning rate")

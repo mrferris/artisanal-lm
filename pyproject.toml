@@ -56,3 +56,4 @@ line-length = 160
 # Enable rules by selecting their prefixes or explicit codes
 select = ["E", "F", "W", "I", "COM812"]
 extend-select = ["UP"]
+ignore = ["F722"]

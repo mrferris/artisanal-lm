@@ -7,8 +7,11 @@ from lm.model.components.attention import Rope
 from lm.model.components.linear import Embedding, Linear, RMSNorm
 from lm.model.components.transformer import Transformer
 from lm.training.optimization.adamw import AdamW
-from lm.training.reinforcement.dpo import calculate_model_log_probs, calculate_simpo_loss
+from lm.training.reinforcement.dpo import calculate_simpo_loss
+from lm.training.reinforcement.grpo import calculate_grpo_loss
+from lm.training.reinforcement.log_probs import calculate_model_log_probs
 from lm.training.utils.checkpointing import load_checkpoint
+from lm.training.utils.gradient_clipping import clip_gradients
 
 
 class TransformerLM(nn.Module):
@@ -108,7 +111,15 @@ class TrainableModel:
 
         self.optimizer = AdamW(
             model.parameters(),
-            lr=5e-7,
+            lr=5e-5,
+            betas=[0.9, 0.95],
+            eps=1e-4,
+            weight_decay=0.01,
+        )
+
+        self.grpo_optimizer = AdamW(
+            model.parameters(),
+            lr=5e-5,
             betas=[0.9, 0.95],
             eps=1e-4,
             weight_decay=0.01,
@@ -151,13 +162,14 @@ class TrainableModel:
             dtype=int,
         ).to(self.model.device)
 
-        log_probs = calculate_model_log_probs(
+        per_token_log_probs, _ = calculate_model_log_probs(
             self.model,
             prompt_token_sequence=prompt_tensor,
             prompt_lengths=prompt_length_tensor,
             output_token_sequence=response_tensor,
             output_length=response_length_tensor,
         )
+        log_probs = per_token_log_probs.sum(dim=-1)
 
         loss = calculate_simpo_loss(
             policy_positive_log_prob=log_probs[0],
@@ -172,14 +184,104 @@ class TrainableModel:
         self.optimizer.step()
 
         # Measure the step's effects.
-        after_log_probs = calculate_model_log_probs(
+        after_per_token_log_probs, _ = calculate_model_log_probs(
             self.model,
             prompt_token_sequence=prompt_tensor,
             prompt_lengths=prompt_length_tensor,
             output_token_sequence=response_tensor,
             output_length=response_length_tensor,
         )
+        after_log_probs = after_per_token_log_probs.sum(dim=-1)
         before_probs = torch.exp(log_probs) * 100
         after_probs = torch.exp(after_log_probs) * 100
+        print(tuple((after_probs - before_probs).tolist()))
 
         return tuple((after_probs - before_probs).tolist())
+
+    def do_grpo_step(
+        self,
+        prompt: list[int],
+        responses: list[list[int]],
+        rewards: list[float],
+        num_steps: int,
+        clip_epsilon: float = 0.2,
+        gradient_limit: float = 1.0,
+    ) -> list[float]:
+        """
+        Executes GRPO training loop on a group of (prompt, response, reward) tuples.
+
+        Args:
+            prompt: List of token IDs for the prompt.
+            responses: List of response token ID sequences.
+            rewards: List of reward scores for each response.
+            num_steps: Number of optimization steps to take.
+            clip_epsilon: PPO-style clip range for importance ratios.
+            gradient_limit: Maximum L2 norm for gradient clipping.
+
+        Returns:
+            List of loss values, one per optimization step.
+        """
+        assert len(rewards) == len(responses)
+
+        device = self.model.device
+        group_size = len(rewards)
+
+        # Make tensors of the inputs
+        prompt_lengths = torch.tensor([len(prompt)] * group_size, dtype=torch.long, device=device)
+        prompt_tensor = torch.tensor(prompt, dtype=torch.long, device=device).expand(group_size, -1)
+        response_lengths = torch.tensor([len(r) for r in responses], dtype=torch.long, device=device)
+        response_tensor = pad_sequence(
+            [torch.tensor(r, dtype=torch.long) for r in responses],
+            batch_first=True,
+            padding_value=0,
+        ).to(device)
+
+        # Calculate advantages: mean-subtracted rewards
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float, device=device)
+        advantages = rewards_tensor - rewards_tensor.mean()
+
+        # Calculate original log probs (frozen reference)
+        with torch.no_grad():
+            generation_policy_log_probs, response_mask = calculate_model_log_probs(
+                self.model,
+                prompt_tensor,
+                prompt_lengths,
+                response_tensor,
+                response_lengths,
+            )
+
+        losses = []
+        for step in range(num_steps):
+            # Calculate per-token log probs for current model
+            log_probs, response_mask = calculate_model_log_probs(
+                self.model,
+                prompt_tensor,
+                prompt_lengths,
+                response_tensor,
+                response_lengths,
+            )
+
+            # Calculate GRPO loss (scalar)
+            loss = calculate_grpo_loss(
+                log_probs,
+                generation_policy_log_probs,
+                response_mask=response_mask,
+                advantages=advantages,
+                clip_epsilon=clip_epsilon,
+            )
+
+            # Reset gradients
+            self.grpo_optimizer.zero_grad()
+
+            # Backprop GRPO loss
+            loss.backward()
+
+            # Clip gradients
+            clip_gradients(list(self.model.parameters()), max_l2_norm=gradient_limit)
+
+            # Step optimizer
+            self.grpo_optimizer.step()
+
+            losses.append(loss.item())
+
+        return losses
