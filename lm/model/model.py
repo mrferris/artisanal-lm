@@ -64,19 +64,105 @@ class TransformerLM(nn.Module):
 
         self.output_embedding = Linear(d_model, vocab_size, device, dtype)
 
-    def forward(self, input: Int[torch.Tensor, "batch_size sequence_length"]) -> Float[torch.Tensor, "batch_size sequence_length vocab_size"]:
+    def forward(
+        self,
+        input: Int[torch.Tensor, "batch_size sequence_length"],
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ):
+        """
+        Args:
+            kv_cache: Controls KV caching behavior.
+                None — no caching, return logits only.
+                []   — initial encode: no prior cache, return (logits, kv_cache).
+                [(K,V), ...] — continue: use prior cache, return (logits, new_kv_cache).
+        """
         output = self.embedding_layer(input)
 
         batch, seq_len, _ = output.shape
-        token_positions = torch.arange(seq_len, device=self.device).unsqueeze(0).repeat(batch, 1)
+        use_cache = kv_cache is not None
 
-        for layer in self.transformer_layers:
-            output = layer(output, token_positions)
+        # When using KV cache, token positions start after the cached prefix
+        cache_len = kv_cache[0][0].shape[-2] if kv_cache else 0
+        token_positions = torch.arange(cache_len, cache_len + seq_len, device=self.device).unsqueeze(0).repeat(batch, 1)
+
+        new_kv_cache = [] if use_cache else None
+
+        for i, layer in enumerate(self.transformer_layers):
+            # () = initial encode for this layer, (K,V) = continue with prior
+            layer_cache = kv_cache[i] if kv_cache else (() if use_cache else None)
+            result = layer(output, token_positions, kv_cache=layer_cache)
+
+            if use_cache:
+                output, layer_kv = result
+                new_kv_cache.append(layer_kv)
+            else:
+                output = result
 
         output = self.output_norm(output)
         output = self.output_embedding(output)
 
+        if use_cache:
+            return output, new_kv_cache
         return output
+
+    def encode_kv(self, prefix_tokens: Int[torch.Tensor, "batch_size seq_len"]):
+        """Compute KV cache for a prefix sequence.
+
+        Args:
+            prefix_tokens: Token tensor of shape [batch, seq_len].
+
+        Returns:
+            (logits, kv_cache) where logits has shape [batch, seq_len, vocab_size]
+            and kv_cache is a list of per-layer (K, V) tuples.
+        """
+        with torch.no_grad():
+            logits, kv = self.forward(prefix_tokens, kv_cache=[])
+        return logits, kv
+
+    def forward_with_kv(
+        self,
+        suffix_tokens: Int[torch.Tensor, "batch_size seq_len"],
+        kv_cache,
+    ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
+        """Forward suffix tokens using a pre-computed prefix KV cache.
+
+        Automatically expands the cache's batch dimension to match
+        suffix_tokens if needed (e.g. cache is batch=1, suffix is batch=N).
+
+        Args:
+            suffix_tokens: Tokens to forward, shape [batch, seq_len].
+            kv_cache: Cache returned by encode_kv().
+
+        Returns:
+            Logits tensor of shape [batch, seq_len, vocab_size].
+        """
+        batch_size = suffix_tokens.shape[0]
+        cache_batch = kv_cache[0][0].shape[0]
+        if batch_size != cache_batch and cache_batch == 1:
+            kv_cache = [
+                (k.expand(batch_size, -1, -1, -1), v.expand(batch_size, -1, -1, -1))
+                for k, v in kv_cache
+            ]
+        with torch.no_grad():
+            logits, _ = self.forward(suffix_tokens, kv_cache=kv_cache)
+        return logits
+
+    def forward_incremental(self, token, kv_cache):
+        """Forward a single token and return updated KV cache.
+
+        Args:
+            token: Token tensor of shape [batch, 1].
+            kv_cache: Running KV cache from encode_kv() or a prior
+                      forward_incremental() call.
+
+        Returns:
+            (logits, updated_kv_cache) where logits has shape
+            [batch, 1, vocab_size] and updated_kv_cache contains
+            the full sequence K/V (prior cache + new token).
+        """
+        with torch.no_grad():
+            logits, updated_kv = self.forward(token, kv_cache=kv_cache)
+        return logits, updated_kv
 
     def param_count(self) -> tuple[int, int]:
         """

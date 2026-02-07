@@ -30,7 +30,20 @@ class Transformer(nn.Module):
         self,
         input: Float[torch.Tensor, "... seq_len d_model"],
         token_positions: Float[torch.Tensor, "... seq_len"],
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
-        attended_input = input + self.attention(self.attention_prenorm(input), token_positions)
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        attn_out = self.attention(
+            self.attention_prenorm(input),
+            token_positions,
+            kv_cache=kv_cache,
+        )
 
-        return attended_input + self.ffn(self.ffn_prenorm(attended_input))
+        if kv_cache is not None:
+            attn_out, layer_kv = attn_out
+
+        attended_input = input + attn_out
+        output = attended_input + self.ffn(self.ffn_prenorm(attended_input))
+
+        if kv_cache is not None:
+            return output, layer_kv
+        return output

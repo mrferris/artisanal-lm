@@ -97,12 +97,26 @@ class MultiHeadSelfAttention(nn.Module):
         self.w_v = Linear(d_model, d_model, device, dtype)
         self.w_output = Linear(d_model, d_model, device, dtype)
 
+        # Pre-compute causal mask as registered buffer
+        max_seq_len = rope.max_seq_len if rope is not None else 2048
+        causal = torch.triu(torch.ones((max_seq_len, max_seq_len), dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", ~causal, persistent=False)
+
     def forward(
         self,
         input: Float[torch.Tensor, "... seq_len d_model"],
         token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        """
+        Args:
+            kv_cache: Controls KV caching behavior.
+                None  — no caching, return attention output only.
+                ()    — initial encode: no prior cache, return (output, (K, V)).
+                (K,V) — continue: concat with prior, return (output, (new_K, new_V)).
+        """
         *batch_dims, seq_len, _ = input.shape
+        use_cache = kv_cache is not None
 
         # Project the input onto the Wq, Wk, and Wv
         Q = self.w_q(input)
@@ -138,13 +152,26 @@ class MultiHeadSelfAttention(nn.Module):
             Q = Q_flat.reshape(original_q_shape)
             K = K_flat.reshape(original_k_shape)
 
-        causal_mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input.device), diagonal=1)
-        causal_mask = ~causal_mask
+        # Concat cached K/V from prefix if provided (truthy = has actual data)
+        if kv_cache:
+            cached_K, cached_V = kv_cache
+            K = torch.cat([cached_K, K], dim=-2)
+            V = torch.cat([cached_V, V], dim=-2)
 
-        attention = scaled_dot_product_attention(Q, K, V, mask=causal_mask)
+        # Capture K/V for caching after concat so callers get the full sequence
+        if use_cache:
+            new_kv = (K, V)
+
+        total_len = K.shape[-2]
+        # Slice the pre-computed causal mask: Q attends to all K positions
+        mask = self.causal_mask[total_len - seq_len : total_len, :total_len]
+
+        attention = scaled_dot_product_attention(Q, K, V, mask=mask)
         attention = attention.transpose(-3, -2)
         attention = attention.reshape(*batch_dims, seq_len, self.d_model)
 
         attention = self.w_output(attention)
 
+        if use_cache:
+            return attention, new_kv
         return attention
