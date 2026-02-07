@@ -5,9 +5,9 @@ from jaxtyping import Float, Int
 def calculate_model_log_probs(
     model: torch.nn.Module,
     prompt_token_sequence: Int[torch.Tensor, "batch_size seq_len"],
-    prompt_lengths: Int[torch.Tensor, "batch_size"],
+    prompt_lengths: Int[torch.Tensor, " batch_size"],
     output_token_sequence: Int[torch.Tensor, "batch_size seq_len"],
-    output_length: Int[torch.Tensor, "batch_size"],
+    output_length: Int[torch.Tensor, " batch_size"],
 ) -> tuple[Float[torch.Tensor, "batch_size seq_len"], Float[torch.Tensor, "batch_size seq_len"]]:
     """
     Calculates per-token log probabilities for the response tokens, given a prompt.

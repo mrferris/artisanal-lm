@@ -6,7 +6,7 @@ def calculate_grpo_loss(
     policy_log_probs: Float[torch.Tensor, "batch_size seq_len"],
     generation_policy_log_probs: Float[torch.Tensor, "batch_size seq_len"],
     response_mask: Float[torch.Tensor, "batch_size seq_len"],
-    advantages: Float[torch.Tensor, "batch_size"],
+    advantages: Float[torch.Tensor, " batch_size"],
     clip_epsilon: float = 0.2,
 ) -> Float[torch.Tensor, ""]:
     """
