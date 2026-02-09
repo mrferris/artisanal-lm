@@ -289,31 +289,35 @@ class TrainableModel:
         prompt: list[int],
         responses: list[list[int]],
         rewards: list[float],
-        num_steps: int,
+        target_kl: float,
+        max_steps: int = 100,
         clip_epsilon: float = 0.2,
         gradient_limit: float = 1.0,
-    ) -> list[float]:
+    ) -> dict:
         """
-        Executes GRPO training loop on a group of (prompt, response, reward) tuples.
+        Executes GRPO training loop on a group of (prompt, response, reward) tuples,
+        continuing until the model's KL divergence from its pre-training state reaches target_kl.
 
         Args:
             prompt: List of token IDs for the prompt.
             responses: List of response token ID sequences.
             rewards: List of reward scores for each response.
-            num_steps: Number of optimization steps to take.
+            target_kl: Target KL divergence to reach before stopping.
+            max_steps: Safety cap on number of optimization steps.
             clip_epsilon: PPO-style clip range for importance ratios.
             gradient_limit: Maximum L2 norm for gradient clipping.
 
         Returns:
-            List of loss values, one per optimization step.
+            Dict with losses, kl_values, steps_taken, and final_kl.
         """
         assert len(rewards) == len(responses)
 
         device = self.model.device
         group_size = len(rewards)
+        prompt_len = len(prompt)
 
         # Make tensors of the inputs
-        prompt_lengths = torch.tensor([len(prompt)] * group_size, dtype=torch.long, device=device)
+        prompt_lengths = torch.tensor([prompt_len] * group_size, dtype=torch.long, device=device)
         prompt_tensor = torch.tensor(prompt, dtype=torch.long, device=device).expand(group_size, -1)
         response_lengths = torch.tensor([len(r) for r in responses], dtype=torch.long, device=device)
         response_tensor = pad_sequence(
@@ -322,11 +326,20 @@ class TrainableModel:
             padding_value=0,
         ).to(device)
 
+        # Build full sequences for KL computation
+        full_sequences = torch.cat((prompt_tensor, response_tensor), dim=1)
+        seq_len = full_sequences.shape[1]
+
+        # Build response position mask (excludes prompt and padding)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0)
+        response_ends = prompt_len + response_lengths
+        response_position_mask = (positions >= prompt_len) & (positions < response_ends.unsqueeze(1))
+
         # Calculate advantages: mean-subtracted rewards
         rewards_tensor = torch.tensor(rewards, dtype=torch.float, device=device)
         advantages = rewards_tensor - rewards_tensor.mean()
 
-        # Calculate original log probs (frozen reference)
+        # Calculate original log probs (frozen reference) and reference logits for KL
         with torch.no_grad():
             generation_policy_log_probs, response_mask = calculate_model_log_probs(
                 self.model,
@@ -335,9 +348,14 @@ class TrainableModel:
                 response_tensor,
                 response_lengths,
             )
+            before_logits = self.model(full_sequences)
+            before_log_probs_full = torch.log_softmax(before_logits, dim=-1)
+            before_probs_full = torch.exp(before_log_probs_full)
 
         losses = []
-        for step in range(num_steps):
+        kl_values = []
+        step = 0
+        while step < max_steps:
             # Calculate per-token log probs for current model
             log_probs, response_mask = calculate_model_log_probs(
                 self.model,
@@ -369,5 +387,26 @@ class TrainableModel:
             self.grpo_optimizer.step()
 
             losses.append(loss.item())
+            step += 1
 
-        return losses
+            # Compute KL divergence from pre-training distribution
+            with torch.no_grad():
+                after_logits = self.model(full_sequences)
+                after_log_probs_full = torch.log_softmax(after_logits, dim=-1)
+                kl_per_position = (
+                    before_probs_full * (before_log_probs_full - after_log_probs_full)
+                ).sum(dim=-1)
+                masked_kl = kl_per_position * response_position_mask
+                kl = masked_kl.sum() / response_position_mask.sum().clamp(min=1)
+                kl = kl.item()
+
+            kl_values.append(kl)
+            if kl >= target_kl:
+                break
+
+        return {
+            "losses": losses,
+            "kl_values": kl_values,
+            "steps_taken": step,
+            "final_kl": kl_values[-1] if kl_values else 0.0,
+        }
