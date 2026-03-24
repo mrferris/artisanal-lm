@@ -4,6 +4,7 @@ import os
 import pickle
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
+from collections.abc import Callable
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import BinaryIO
@@ -15,10 +16,18 @@ PRE_TOKENIZATION_REGEX = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\
 COMPILED_PRE_TOKENIZATION_REGEX = re.compile(PRE_TOKENIZATION_REGEX)
 
 
-def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+def train_bpe(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
     Creates a BPE tokenizer vocabulary and its ordered merges.
 
+    If ``progress_callback`` is given, it is called as ``progress_callback(done, total)``
+    periodically during the merge loop (and once at completion) so callers can report
+    determinate progress.
     """
     # Vocabulary Initialization:
     vocab: dict[int, bytes] = {}
@@ -53,6 +62,12 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
 
         vocab[next_id] = new_token
         next_id += 1
+
+        if progress_callback is not None and (i % 50 == 0 or i == max_merges - 1):
+            progress_callback(len(merges), max_merges)
+
+    if progress_callback is not None:
+        progress_callback(len(merges), max_merges)
 
     return (vocab, merges)
 
