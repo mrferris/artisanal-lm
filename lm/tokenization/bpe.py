@@ -21,6 +21,7 @@ def train_bpe(
     vocab_size: int,
     special_tokens: list[str],
     progress_callback: Callable[[int, int], None] | None = None,
+    token_callback: Callable[[int, bytes], None] | None = None,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
     Creates a BPE tokenizer vocabulary and its ordered merges.
@@ -28,6 +29,10 @@ def train_bpe(
     If ``progress_callback`` is given, it is called as ``progress_callback(done, total)``
     periodically during the merge loop (and once at completion) so callers can report
     determinate progress.
+
+    If ``token_callback`` is given, it is called as ``token_callback(token_id, token_bytes)``
+    for every newly-created merge token, in id order, so callers can stream the vocabulary
+    as it is built.
     """
     # Vocabulary Initialization:
     vocab: dict[int, bytes] = {}
@@ -61,6 +66,8 @@ def train_bpe(
         merges.append(most_common_pair)
 
         vocab[next_id] = new_token
+        if token_callback is not None:
+            token_callback(next_id, new_token)
         next_id += 1
 
         if progress_callback is not None and (i % 50 == 0 or i == max_merges - 1):
