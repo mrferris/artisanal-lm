@@ -11,11 +11,25 @@ def save_checkpoint(
     optimizer: optim.Optimizer,
     iteration: int,
     out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    meta: dict | None = None,
 ):
-    state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "iteration": iteration}
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+        "meta": meta or {},
+    }
     torch.save(state, out)
 
     return
+
+
+def read_checkpoint_meta(
+    src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    device: torch.device | None = None,
+) -> dict:
+    state = torch.load(src, weights_only=False, map_location=device)
+    return state.get("meta") or {}
 
 
 def load_checkpoint(

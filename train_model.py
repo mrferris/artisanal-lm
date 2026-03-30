@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import math
 import os
 import time
@@ -158,7 +159,7 @@ def train(config: TrainingConfig, step_callback=None):
     param_count = model.param_count()[1]
 
     logger = TrainingLogger(config=config, param_count=param_count)
-    checkpointer = Checkpointer()
+    checkpointer = Checkpointer(meta=vocab_fingerprint(config.vocab_path, config.vocab_size))
     if config.checkpoint_resume_path:
         checkpointer.load_checkpoint(
             model=model,
@@ -315,9 +316,18 @@ class TrainingLogger:
                 self.tensorboard_writer.add_scalar(key, value, step)
 
 
+def vocab_fingerprint(vocab_path, vocab_size):
+    meta = {"vocab_size": vocab_size}
+    if vocab_path and os.path.exists(vocab_path):
+        with open(vocab_path, "rb") as f:
+            meta["vocab_sha256"] = hashlib.sha256(f.read()).hexdigest()
+    return meta
+
+
 class Checkpointer:
-    def __init__(self):
+    def __init__(self, meta=None):
         self.start_time = datetime.now().strftime("%-m-%-d-%y_%H:%M")
+        self.meta = meta
 
     def save_checkpoint(
         self,
@@ -332,6 +342,7 @@ class Checkpointer:
             optimizer=optimizer,
             iteration=iteration,
             out=os.path.join("checkpoints", f"{run_name}-{self.start_time}", f"checkpoint_step_{iteration}"),
+            meta=self.meta,
         )
 
     def load_checkpoint(self, model, optimizer, checkpoint_path):
