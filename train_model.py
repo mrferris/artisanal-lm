@@ -8,10 +8,10 @@ from datetime import datetime
 import numpy
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import wandb
+# wandb and torch.utils.tensorboard are imported lazily inside TrainingLogger so an
+# embedded run (YouGPT) with both disabled doesn't require them to be installed.
 from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
@@ -77,8 +77,19 @@ class TrainingConfig:
     disable_tensorboard: bool
     run_name: str
 
+    # Which batch loader to use: "conversation" (conversation-aligned, padded) or
+    # "plain" (uniform random fixed-length windows over the token stream).
+    loader: str = "conversation"
 
-def train(config: TrainingConfig):
+
+def train(config: TrainingConfig, step_callback=None):
+    """
+    Run a pre-training loop.
+
+    step_callback: optional callable(step:int, step_state:dict) invoked after each
+    step's metrics are logged. Lets an embedder (e.g. the YouGPT app) stream live
+    loss without depending on wandb/tensorboard.
+    """
     if config.train_reference:
         model = ReferenceTransformerLM(
             d_model=config.d_model,
@@ -123,19 +134,25 @@ def train(config: TrainingConfig):
         eps=config.eps,
     )
 
-    training_data_loader = ConversationBatchLoader(
+    LoaderClass = BatchLoader if config.loader == "plain" else ConversationBatchLoader
+
+    training_data_loader = LoaderClass(
         file_path=config.training_data_path,
         batch_size=config.batch_size,
         context_length=config.context_length,
         device=config.device,
     )
 
-    validation_batch_loader = ConversationBatchLoader(
-        file_path=config.validation_data_path,
-        batch_size=config.batch_size,
-        context_length=config.context_length,
-        device=config.device,
-    )
+    # Validation is optional — an embedded run may only have training data.
+    if config.validation_data_path:
+        validation_batch_loader = LoaderClass(
+            file_path=config.validation_data_path,
+            batch_size=config.batch_size,
+            context_length=config.context_length,
+            device=config.device,
+        )
+    else:
+        validation_batch_loader = None
 
     # Logged and used for MFU calculations.
     param_count = model.param_count()[1]
@@ -158,7 +175,15 @@ def train(config: TrainingConfig):
         tokenizer = None
 
     t0 = time.time()
-    for step in tqdm(range(1, config.training_steps + 1)):
+    # Last finite loss seen — reported for any step we roll back (see the stability guard
+    # below) so the streamed loss curve stays continuous instead of emitting "loss nan".
+    last_good_loss = None
+    recovered_steps = 0
+    # Snapshot of the last numerically-healthy weights, restored on a bad step.
+    stable_state = [p.detach().clone() for p in model.parameters()]
+    # When embedded (a step_callback is driving progress), suppress the tqdm bar so its
+    # carriage-return output doesn't interleave with the machine-readable progress lines.
+    for step in tqdm(range(1, config.training_steps + 1), disable=step_callback is not None):
         # Put the model in training mode.
         model.train()
 
@@ -191,8 +216,32 @@ def train(config: TrainingConfig):
         # Clip the gradients to some max total l2 norm.
         clip_gradients(model.parameters(), config.gradient_limit)
 
-        # Optimize the gradients.
-        optimizer.step()
+        loss_val = loss.item()
+        pre_step_ok = math.isfinite(loss_val) and all(
+            p.grad is None or torch.isfinite(p.grad).all()
+            for p in model.parameters()
+        )
+        step_healthy = False
+        if pre_step_ok:
+            optimizer.step()
+            step_healthy = all(torch.isfinite(p).all() for p in model.parameters())
+
+        if step_healthy:
+            # Advance the rollback snapshot to these weights.
+            with torch.no_grad():
+                for buf, p in zip(stable_state, model.parameters()):
+                    buf.copy_(p.detach())
+            last_good_loss = loss_val
+        else:
+            # Restore the last healthy weights.
+            with torch.no_grad():
+                for p, buf in zip(model.parameters(), stable_state):
+                    p.copy_(buf)
+            recovered_steps += 1
+            if last_good_loss is not None:
+                loss_val = last_good_loss
+            print(f"[stability] step {step}: non-finite loss/grad/weights — rolled back to "
+                  f"last healthy weights (total recovered: {recovered_steps})", flush=True)
 
         step_state = {}
         if step % config.mfu_interval == 0:
@@ -210,16 +259,25 @@ def train(config: TrainingConfig):
 
         if step % config.checkpoint_interval == 0:
             checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
-        if step % config.validation_interval == 0:
+        if validation_batch_loader is not None and step % config.validation_interval == 0:
             validation_loss = calculate_validation_loss(
                 model=model,
                 loader=validation_batch_loader,
             )
             step_state["val_loss"] = validation_loss.item()
 
-        step_state["loss"] = loss.item()
-        step_state["perplexity"] = math.exp(loss.item())
+        # loss_val was computed above (and, for a skipped step, set to the last good loss).
+        step_state["loss"] = loss_val
+        try:
+            # perplexity is display-only; a transient loss spike (huge/inf loss)
+            # must never crash the run via math.exp overflow.
+            step_state["perplexity"] = math.exp(loss_val)
+        except (OverflowError, ValueError):
+            step_state["perplexity"] = float("inf")
         logger.log(step_state=step_state, step=step)
+
+        if step_callback is not None:
+            step_callback(step, step_state)
 
     return
 
@@ -235,6 +293,8 @@ class TrainingLogger:
 
         config_dict["non_embedding_params"] = param_count
         if not self.disable_wandb:
+            import wandb
+
             self.wandb_handler = wandb.init(
                 name=f"{self.run_name}-{current_time}",
                 entity="michael-ferris-1928-michael-ferris",
@@ -243,6 +303,8 @@ class TrainingLogger:
             )
 
         if not self.disable_tensorboard:
+            from torch.utils.tensorboard import SummaryWriter
+
             self.tensorboard_writer = SummaryWriter(f"runs/{self.run_name}-{current_time}")
 
     def log(self, step_state, step):
@@ -322,7 +384,7 @@ def main():
     parser.add_argument("--epsilon", type=float, default=1e-5, help="Epsilon cosntant for AdamW Optimization")
     parser.add_argument("--training-steps", type=int, default=10_000, help="Number of training iterations to run")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Steps before specified learning rate reached")
-    parser.add_argument("--gradient-limit", type=int, default=1.0, help="L2 gabove which will be clipped")
+    parser.add_argument("--gradient-limit", type=float, default=1.0, help="L2 norm above which gradients will be clipped")
     parser.add_argument("--training-data-path", type=str, required=True, help="Path to training data (.npy)")
     parser.add_argument("--validation-data-path", type=str, required=False, help="Path to validation data (.npy)")
     parser.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every n training steps")
@@ -338,6 +400,8 @@ def main():
     parser.add_argument("--vocab-path", type=str, default=None, help="Path to .json vocab file for example training sequences")
     parser.add_argument("--merges-path", type=str, default=None, help="Path to .pkl merge file for example training sequences")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path of checkpoint from which to resume training")
+    parser.add_argument("--progress-stdout", dest="progress_stdout", action="store_true", help="Print a machine-readable 'PROGRESS step N total loss L' line each step for embedders to parse")
+    parser.add_argument("--loader", type=str, default="conversation", choices=["conversation", "plain"], help="Batch loader: 'conversation' (conversation-aligned, padded) or 'plain' (uniform random fixed-length windows)")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -379,10 +443,23 @@ def main():
         run_name=args.run_name,
         disable_wandb=args.disable_wandb,
         disable_tensorboard=args.disable_tensorboard,
+        loader=args.loader,
     )
 
     print(f"Training with config: {config}")
-    train(config=config)
+
+    step_callback = None
+    if args.progress_stdout:
+        total_steps = config.training_steps
+
+        def step_callback(step, step_state):
+            loss = step_state.get("loss")
+            msg = f"PROGRESS step {step} {total_steps} loss {loss:.6f}"
+            if "val_loss" in step_state:
+                msg += f" val {step_state['val_loss']:.6f}"
+            print(msg, flush=True)
+
+    train(config=config, step_callback=step_callback)
 
 
 if __name__ == "__main__":
