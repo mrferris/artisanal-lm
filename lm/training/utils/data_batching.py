@@ -45,7 +45,7 @@ def load_batch(
 
 class ConversationBatchLoader:
     def __init__(self, file_path: str, batch_size: int, context_length: int, device: torch.device):
-        self.tokens = np.memmap(file_path, dtype=np.uint16, mode="r")
+        self.tokens = np.load(file_path, mmap_mode="r")
         self.batch_size = batch_size
         self.context_length = context_length
         self.device = device
@@ -116,7 +116,18 @@ class ConversationBatchLoader:
                 for msg_start, msg_end in messages:
                     msg_length = msg_end - msg_start
 
-                    if chunk_token_count + msg_length > self.context_length:
+                    if msg_length > self.context_length:
+                        # Flush, then slice the over-long message to fit the context window.
+                        if chunk_token_count > 0:
+                            chunks.append((chunk_start, chunk_token_count))
+                            chunk_token_count = 0
+                        pos = msg_start
+                        while pos < msg_end:
+                            piece = min(self.context_length, msg_end - pos)
+                            chunks.append((pos, piece))
+                            pos += piece
+                        chunk_start = msg_end
+                    elif chunk_token_count + msg_length > self.context_length:
                         # Save current chunk and start a new one
                         if chunk_token_count > 0:
                             chunks.append((chunk_start, chunk_token_count))

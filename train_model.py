@@ -346,7 +346,7 @@ class BatchLoader:
         context_length: int,
         device: torch.device,
     ):
-        self.file = numpy.memmap(file_path, dtype=numpy.uint16, mode="r")
+        self.file = numpy.load(file_path, mmap_mode="r")
         self.batch_size = batch_size
         self.context_length = context_length
         self.device = device
