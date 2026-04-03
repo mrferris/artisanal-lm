@@ -17,7 +17,7 @@ from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
-from lm.training.loss.cross_entropy import cross_entropy_masked
+from lm.training.loss.cross_entropy import cross_entropy
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
 from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
@@ -208,7 +208,7 @@ def train(config: TrainingConfig, step_callback=None):
             tqdm.write(f"Step {step} sample: {decoded_text}")
 
         output = model(train)
-        loss = cross_entropy_masked(output, label, train)
+        loss = cross_entropy(output, label)
 
         # Backpropogate and calculate gradients.
         optimizer.zero_grad()
@@ -372,7 +372,7 @@ def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
         validation_data, validation_label = loader.load_batch()
         validation_output = model(validation_data)
 
-        validation_loss = cross_entropy_masked(validation_output, validation_label, validation_data)
+        validation_loss = cross_entropy(validation_output, validation_label)
 
         return validation_loss
 
