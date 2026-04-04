@@ -1,21 +1,33 @@
-import math
-
 import torch
 
 
-def clip_gradients(params: list[torch.nn.Parameter], max_l2_norm: float, eps=1e-6) -> None:
+def clip_gradients(
+    params,
+    max_l2_norm: float,
+    eps: float = 1e-6,
+) -> tuple[float, bool]:
     """
-    Implements clipping of L2 norm of gradients.
-    """
-    summed_grad_norm = 0.0
-    for param in params:
-        if param.grad is not None:
-            summed_grad_norm += param.grad.norm(2) ** 2
+    Clip the combined L2 norm of all gradients.
 
-    l2_norm = math.sqrt(summed_grad_norm)
-    if l2_norm > max_l2_norm:
+    Parameter iterables such as ``model.parameters()`` are one-shot generators,
+    so materialize the parameters with gradients before making the norm and
+    scaling passes.
+
+    Returns:
+        The total gradient norm before clipping and whether clipping was applied.
+    """
+    params_with_grad = [param for param in params if param.grad is not None]
+    if not params_with_grad:
+        return 0.0, False
+
+    squared_norms = torch.stack(
+        [torch.sum(param.grad.detach().float() ** 2) for param in params_with_grad]
+    )
+    l2_norm = float(torch.sqrt(squared_norms.sum()).item())
+    clipped = l2_norm > max_l2_norm
+    if clipped:
         scaling = max_l2_norm / (l2_norm + eps)
-        for param in params:
-            if param.grad is not None:
-                param.grad.mul_(scaling)
-    return
+        for param in params_with_grad:
+            param.grad.mul_(scaling)
+
+    return l2_norm, clipped

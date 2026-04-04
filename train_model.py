@@ -180,6 +180,7 @@ def train(config: TrainingConfig, step_callback=None):
     # below) so the streamed loss curve stays continuous instead of emitting "loss nan".
     last_good_loss = None
     recovered_steps = 0
+    clipped_steps = 0
     # Snapshot of the last numerically-healthy weights, restored on a bad step.
     stable_state = [p.detach().clone() for p in model.parameters()]
     # When embedded (a step_callback is driving progress), suppress the tqdm bar so its
@@ -215,7 +216,11 @@ def train(config: TrainingConfig, step_callback=None):
         loss.backward()
 
         # Clip the gradients to some max total l2 norm.
-        clip_gradients(model.parameters(), config.gradient_limit)
+        gradient_norm, was_clipped = clip_gradients(
+            model.parameters(), config.gradient_limit
+        )
+        if was_clipped:
+            clipped_steps += 1
 
         loss_val = loss.item()
         pre_step_ok = math.isfinite(loss_val) and all(
@@ -244,7 +249,11 @@ def train(config: TrainingConfig, step_callback=None):
             print(f"[stability] step {step}: non-finite loss/grad/weights — rolled back to "
                   f"last healthy weights (total recovered: {recovered_steps})", flush=True)
 
-        step_state = {}
+        step_state = {
+            "gradient_norm": gradient_norm,
+            "gradient_clipped": int(was_clipped),
+            "gradient_clip_rate": clipped_steps / step,
+        }
         if step % config.mfu_interval == 0:
             synchronize_accelerator(config.device)
             t1 = time.time()
@@ -468,6 +477,11 @@ def main():
             msg = f"PROGRESS step {step} {total_steps} loss {loss:.6f}"
             if "val_loss" in step_state:
                 msg += f" val {step_state['val_loss']:.6f}"
+            msg += (
+                f" grad {step_state['gradient_norm']:.6f}"
+                f" clipped {step_state['gradient_clipped']}"
+                f" clip_rate {step_state['gradient_clip_rate']:.6f}"
+            )
             print(msg, flush=True)
 
     train(config=config, step_callback=step_callback)
