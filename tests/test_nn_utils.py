@@ -86,3 +86,21 @@ def test_gradient_clipping():
             t1_c_grad.detach().numpy(),
             atol=1e-6,
         )
+
+
+def test_gradient_clipping_materializes_generator_and_reports_stats():
+    params = [torch.nn.Parameter(torch.zeros(2)) for _ in range(2)]
+    params[0].grad = torch.tensor([3.0, 4.0])
+    params[1].grad = torch.tensor([0.0, 0.0])
+
+    norm_before, clipped = run_gradient_clipping(
+        (param for param in params),
+        max_l2_norm=1.0,
+    )
+
+    combined_norm_after = torch.sqrt(
+        sum(torch.sum(param.grad**2) for param in params)
+    ).item()
+    assert norm_before == 5.0
+    assert clipped is True
+    assert combined_norm_after <= 1.0

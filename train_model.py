@@ -378,12 +378,14 @@ class BatchLoader:
 def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
     model.eval()
     with torch.no_grad():
-        validation_data, validation_label = loader.load_batch()
-        validation_output = model(validation_data)
-
-        validation_loss = cross_entropy(validation_output, validation_label)
-
-        return validation_loss
+        # One random batch is far too noisy to select checkpoints. Average enough
+        # batches to cover 16 * batch_size contexts at every validation interval.
+        losses = []
+        for _ in range(16):
+            validation_data, validation_label = loader.load_batch()
+            validation_output = model(validation_data)
+            losses.append(cross_entropy(validation_output, validation_label))
+        return torch.stack(losses).mean()
 
 
 def main():

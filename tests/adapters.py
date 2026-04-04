@@ -545,7 +545,7 @@ def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: 
     return cross_entropy(inputs, targets)
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -554,7 +554,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    clip_gradients(params=parameters, max_l2_norm=max_l2_norm)
+    return clip_gradients(params=parameters, max_l2_norm=max_l2_norm)
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
