@@ -3,6 +3,24 @@ import torch.nn.functional as F
 from jaxtyping import Float, Int
 
 
+class _CrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, targets):
+        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+        target_logit = logits.gather(dim=-1, index=targets.unsqueeze(-1))
+        ctx.save_for_backward(logits, logsumexp, targets)
+        return (logsumexp - target_logit).mean()
+
+    @staticmethod
+    def backward(ctx, output_gradient):
+        logits, logsumexp, targets = ctx.saved_tensors
+        gradient = torch.exp(logits - logsumexp)
+        target_delta = torch.full_like(targets.unsqueeze(-1), -1, dtype=gradient.dtype)
+        gradient.scatter_add_(-1, targets.unsqueeze(-1), target_delta)
+        gradient.mul_(output_gradient / targets.numel())
+        return gradient.to(logits.dtype), None
+
+
 def cross_entropy(logits: Float[torch.Tensor, "batch_size vocab_size"], targets: Int[torch.Tensor, " batch_size"]) -> Float[torch.Tensor, ""]:
     """
     loss = -log (exp (o) / sum exp (a))
@@ -10,13 +28,7 @@ def cross_entropy(logits: Float[torch.Tensor, "batch_size vocab_size"], targets:
     loss = logsumexp(o) - o
     """
 
-    logsumexp = torch.logsumexp(input=logits, dim=-1, keepdim=True)
-
-    target_logit = logits.gather(dim=-1, index=targets.unsqueeze(-1))
-
-    loss = logsumexp - target_logit
-
-    return loss.mean()
+    return _CrossEntropy.apply(logits, targets)
 
 
 def cross_entropy_masked(

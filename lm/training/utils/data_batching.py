@@ -24,23 +24,17 @@ def load_batch(
         The second containing the correct next token prediction
     """
 
-    # Unpopulated tensors to be returned
-    sequences = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
-    labels = torch.zeros((batch_size, context_length), dtype=torch.long, device=device)
-
     # Generate random sample indices
     max_index = len(tokens) - context_length - 1
     random_indices = random.randint(0, max_index + 1, size=batch_size)
 
-    # Sample and populate tensors
-    for sample_number, sample_index in enumerate(random_indices):
-        sequence = torch.from_numpy(tokens[sample_index : sample_index + context_length].copy()).to(device, dtype=torch.long)
-        label = torch.from_numpy(tokens[sample_index + 1 : sample_index + context_length + 1].copy()).to(device, dtype=torch.long)
-
-        sequences[sample_number] = sequence
-        labels[sample_number] = label
-
-    return (sequences, labels)
+    # Gather B contiguous windows on CPU, then issue one transfer to MPS.  The
+    # previous loop performed 2*B NumPy copies, device transfers, and device
+    # slice assignments per training step.
+    offsets = np.arange(context_length + 1)
+    windows = np.asarray(tokens[random_indices[:, None] + offsets[None, :]])
+    batch = torch.from_numpy(windows).to(device=device, dtype=torch.long)
+    return batch[:, :-1], batch[:, 1:]
 
 
 class ConversationBatchLoader:

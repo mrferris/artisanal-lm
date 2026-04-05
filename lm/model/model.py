@@ -54,13 +54,18 @@ class TransformerLM(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        self.embedding_layer = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+        self.embedding_layer = Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype)
 
         self.transformer_layers = []
         self.transformer_layers = nn.ModuleList(
             [Transformer(d_model=d_model, num_heads=num_heads, d_ff=d_ff, rope=self.rope, device=device, dtype=dtype) for _ in range(num_layers)],
         )
         self.output_norm = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.register_buffer(
+            "position_ids",
+            torch.arange(context_length, device=device),
+            persistent=False,
+        )
 
         self.output_embedding = Linear(d_model, vocab_size, device, dtype)
 
@@ -83,7 +88,10 @@ class TransformerLM(nn.Module):
 
         # When using KV cache, token positions start after the cached prefix
         cache_len = kv_cache[0][0].shape[-2] if kv_cache else 0
-        token_positions = torch.arange(cache_len, cache_len + seq_len, device=self.device).unsqueeze(0).repeat(batch, 1)
+        # All examples in a training batch share positions. Keeping this 1-D
+        # lets RoPE broadcast its cached tables rather than copying them across
+        # every batch item and attention head.
+        token_positions = self.position_ids[cache_len : cache_len + seq_len]
 
         new_kv_cache = [] if use_cache else None
 

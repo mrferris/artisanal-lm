@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from .adapters import run_cross_entropy, run_gradient_clipping, run_softmax
+from lm.training.utils.gradient_clipping import clip_gradients
 
 
 def test_softmax_matches_pytorch():
@@ -21,6 +22,17 @@ def test_softmax_matches_pytorch():
         expected.detach().numpy(),
         atol=1e-6,
     )
+
+
+def test_softmax_backward_matches_pytorch():
+    actual_input = torch.randn(3, 5, dtype=torch.float64, requires_grad=True)
+    expected_input = actual_input.detach().clone().requires_grad_(True)
+    output_gradient = torch.randn_like(actual_input)
+
+    run_softmax(actual_input, dim=-1).backward(output_gradient)
+    F.softmax(expected_input, dim=-1).backward(output_gradient)
+
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
 
 
 def test_cross_entropy():
@@ -56,6 +68,17 @@ def test_cross_entropy():
         large_expected_cross_entropy.detach().numpy(),
         atol=1e-4,
     )
+
+
+def test_cross_entropy_backward_matches_pytorch():
+    actual_logits = torch.randn(7, 11, dtype=torch.float64, requires_grad=True)
+    expected_logits = actual_logits.detach().clone().requires_grad_(True)
+    targets = torch.tensor([0, 4, 4, 7, 10, 2, 1])
+
+    run_cross_entropy(actual_logits, targets).backward()
+    F.cross_entropy(expected_logits, targets).backward()
+
+    torch.testing.assert_close(actual_logits.grad, expected_logits.grad)
 
 
 def test_gradient_clipping():
@@ -104,3 +127,25 @@ def test_gradient_clipping_materializes_generator_and_reports_stats():
     assert norm_before == 5.0
     assert clipped is True
     assert combined_norm_after <= 1.0
+
+
+def test_gradient_clipping_async_path_matches_synchronized_path():
+    synchronized = [torch.nn.Parameter(torch.zeros(3)) for _ in range(2)]
+    asynchronous = [torch.nn.Parameter(torch.zeros(3)) for _ in range(2)]
+    gradients = [torch.tensor([3.0, 4.0, 0.0]), torch.tensor([1.0, 2.0, 2.0])]
+    for parameter, gradient in zip(synchronized, gradients):
+        parameter.grad = gradient.clone()
+    for parameter, gradient in zip(asynchronous, gradients):
+        parameter.grad = gradient.clone()
+
+    clip_gradients(synchronized, max_l2_norm=1.0, synchronize=True)
+    norm_tensor, clipped = clip_gradients(
+        asynchronous,
+        max_l2_norm=1.0,
+        synchronize=False,
+    )
+
+    assert isinstance(norm_tensor, torch.Tensor)
+    assert clipped is None
+    for actual, expected in zip(asynchronous, synchronized):
+        torch.testing.assert_close(actual.grad, expected.grad)

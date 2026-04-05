@@ -38,7 +38,7 @@ class Embedding(nn.Module):
         self.initialize()
 
     def forward(self, token_ids: Int[torch.Tensor, "..."]) -> Float[torch.Tensor, "... embedding_dim"]:
-        return self.weights[token_ids]
+        return self.weights[token_ids.to(self.weights.device)]
 
     def initialize(self):
         with torch.no_grad():

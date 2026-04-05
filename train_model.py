@@ -3,6 +3,7 @@ import hashlib
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
@@ -54,7 +55,10 @@ class TrainingConfig:
     learning_rate: float
     training_steps: int
     warmup_steps: int
+    lr_schedule: str
     gradient_limit: float
+    metrics_interval: int
+    preload_batches: bool
 
     # How often to do certain things
     checkpoint_interval: int
@@ -78,6 +82,17 @@ class TrainingConfig:
     disable_tensorboard: bool
     run_name: str
 
+    # Mixed precision training
+    use_mixed_precision: bool = False
+
+    # Optional source-aware profiling of this exact training loop.
+    profile_dir: str | None = None
+    profile_trigger_file: str | None = None
+    profile_wait_steps: int = 5
+    profile_warmup_steps: int = 5
+    profile_active_steps: int = 20
+    seed: int | None = None
+
     # Which batch loader to use: "conversation" (conversation-aligned, padded) or
     # "plain" (uniform random fixed-length windows over the token stream).
     loader: str = "conversation"
@@ -91,6 +106,10 @@ def train(config: TrainingConfig, step_callback=None):
     step's metrics are logged. Lets an embedder (e.g. the YouGPT app) stream live
     loss without depending on wandb/tensorboard.
     """
+    if config.seed is not None:
+        numpy.random.seed(config.seed)
+        torch.manual_seed(config.seed)
+
     if config.train_reference:
         model = ReferenceTransformerLM(
             d_model=config.d_model,
@@ -137,12 +156,15 @@ def train(config: TrainingConfig, step_callback=None):
 
     LoaderClass = BatchLoader if config.loader == "plain" else ConversationBatchLoader
 
-    training_data_loader = LoaderClass(
-        file_path=config.training_data_path,
-        batch_size=config.batch_size,
-        context_length=config.context_length,
-        device=config.device,
-    )
+    loader_kwargs = {
+        "file_path": config.training_data_path,
+        "batch_size": config.batch_size,
+        "context_length": config.context_length,
+        "device": config.device,
+    }
+    if LoaderClass is BatchLoader and config.preload_batches:
+        loader_kwargs["num_batches"] = config.training_steps
+    training_data_loader = LoaderClass(**loader_kwargs)
 
     # Validation is optional — an embedded run may only have training data.
     if config.validation_data_path:
@@ -175,32 +197,151 @@ def train(config: TrainingConfig, step_callback=None):
     else:
         tokenizer = None
 
-    t0 = time.time()
-    # Last finite loss seen — reported for any step we roll back (see the stability guard
-    # below) so the streamed loss curve stays continuous instead of emitting "loss nan".
+    t0 = time.perf_counter()
+    # Last finite loss is retained for display if a non-finite batch is skipped.
     last_good_loss = None
     recovered_steps = 0
     clipped_steps = 0
-    # Snapshot of the last numerically-healthy weights, restored on a bad step.
-    stable_state = [p.detach().clone() for p in model.parameters()]
+    metrics_samples = 0
+
+    device_type = config.device.split(":")[0]
+    if config.use_mixed_precision:
+        # MPS GradScaler is not usable in the project's PyTorch 2.6 build: its
+        # unscale path attempts an unsupported float64 MPS operation. BF16 has
+        # FP32's exponent range, so it does not need loss scaling. CUDA keeps
+        # the conventional FP16 + device-aware GradScaler path.
+        amp_dtype = torch.float16 if device_type == "cuda" else torch.bfloat16
+        scaler = torch.amp.GradScaler("cuda") if device_type == "cuda" else None
+        print(
+            f"Mixed precision enabled: {device_type} autocast {amp_dtype}, "
+            f"loss scaling {'enabled' if scaler is not None else 'not required'}"
+        )
+    else:
+        amp_dtype = None
+        scaler = None
+
+    def amp_context():
+        if not config.use_mixed_precision:
+            return nullcontext()
+        return torch.amp.autocast(device_type=device_type, dtype=amp_dtype)
+
+    range_context = torch.profiler.record_function if config.profile_dir else lambda _: nullcontext()
+    profiler = None
+    profiler_steps_remaining = 0
+    profile_start_step = None
+    if config.profile_dir:
+        os.makedirs(config.profile_dir, exist_ok=True)
+
+        def save_profile(prof):
+            end_step = (
+                profile_start_step + config.profile_active_steps - 1
+                if profile_start_step is not None
+                else prof.step_num
+            )
+            trace_path = os.path.join(
+                config.profile_dir,
+                f"training-steps-{profile_start_step or 1}-{end_step}.json",
+            )
+            summary_path = trace_path.removesuffix(".json") + "-summary.txt"
+            prof.export_chrome_trace(trace_path)
+            with open(summary_path, "w") as summary_file:
+                summary_file.write(
+                    prof.key_averages(group_by_stack_n=1).table(
+                        sort_by="self_cpu_time_total",
+                        row_limit=100,
+                    )
+                )
+            print(f"PROFILE trace {trace_path}", flush=True)
+
+        def start_profiler(wait, warmup, active):
+            active_profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                schedule=torch.profiler.schedule(
+                    wait=wait,
+                    warmup=warmup,
+                    active=active,
+                    repeat=1,
+                ),
+                on_trace_ready=save_profile,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            active_profiler.start()
+            return active_profiler
+
+        # CLI profiling without a trigger retains the original start-of-run
+        # behavior. MikeGPT supplies a trigger file and starts captures live.
+        if config.profile_trigger_file is None:
+            profile_start_step = 1 + config.profile_wait_steps + config.profile_warmup_steps
+            profiler_steps_remaining = (
+                config.profile_wait_steps
+                + config.profile_warmup_steps
+                + config.profile_active_steps
+            )
+            profiler = start_profiler(
+                config.profile_wait_steps,
+                config.profile_warmup_steps,
+                config.profile_active_steps,
+            )
+            print(
+                "Source profiling enabled for the exact training loop: "
+                f"{config.profile_dir}",
+                flush=True,
+            )
+
     # When embedded (a step_callback is driving progress), suppress the tqdm bar so its
     # carriage-return output doesn't interleave with the machine-readable progress lines.
+    timing_window_started = time.perf_counter()
     for step in tqdm(range(1, config.training_steps + 1), disable=step_callback is not None):
+        collect_metrics = (
+            step == 1
+            or step % config.metrics_interval == 0
+            or step % 100 == 0
+            or step % config.validation_interval == 0
+            or step % config.checkpoint_interval == 0
+            or step % config.mfu_interval == 0
+        )
+        if (
+            profiler is None
+            and config.profile_trigger_file
+            and os.path.exists(config.profile_trigger_file)
+        ):
+            try:
+                os.unlink(config.profile_trigger_file)
+            except FileNotFoundError:
+                pass
+            profile_start_step = step
+            profiler_steps_remaining = config.profile_active_steps
+            profiler = start_profiler(0, 0, config.profile_active_steps)
+            print(
+                f"PROFILE capturing steps {step}-"
+                f"{step + config.profile_active_steps - 1}",
+                flush=True,
+            )
+
         # Put the model in training mode.
         model.train()
 
         # Determine the currrent learning rate.
-        lr = learning_rate_scheduler(
-            current_step=step,
-            max_rate=config.learning_rate,
-            min_rate=config.min_learning_rate,
-            cosine_annealing_iterations=config.training_steps,
-            warmup_iterations=config.warmup_steps,
-        )
+        if config.lr_schedule == "constant":
+            if config.warmup_steps > 0 and step < config.warmup_steps:
+                lr = config.learning_rate * step / config.warmup_steps
+            else:
+                lr = config.learning_rate
+        else:
+            lr = learning_rate_scheduler(
+                current_step=step,
+                max_rate=config.learning_rate,
+                min_rate=config.min_learning_rate,
+                cosine_annealing_iterations=config.training_steps,
+                warmup_iterations=config.warmup_steps,
+            )
         optimizer.set_learning_rate(lr)
 
         # Get a batch of data using the data loader
-        train, label = training_data_loader.load_batch()
+        with range_context("train/data_loader"):
+            train, label = training_data_loader.load_batch()
 
         # Print de-tokenized first sequence of the batch
         if tokenizer is not None:
@@ -208,55 +349,75 @@ def train(config: TrainingConfig, step_callback=None):
             decoded_text = tokenizer.decode(first_sequence_ids)
             tqdm.write(f"Step {step} sample: {decoded_text}")
 
-        output = model(train)
-        loss = cross_entropy(output, label)
+        with range_context("train/forward"):
+            with amp_context():
+                output = model(train)
+        with range_context("train/loss"):
+            with amp_context():
+                loss = cross_entropy(output, label)
 
         # Backpropogate and calculate gradients.
-        optimizer.zero_grad()
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+
+        with range_context("train/backward"):
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+        # Unscale gradients before clipping if using mixed precision
+        if scaler is not None and scaler.is_enabled():
+            scaler.unscale_(optimizer)
 
         # Clip the gradients to some max total l2 norm.
-        gradient_norm, was_clipped = clip_gradients(
-            model.parameters(), config.gradient_limit
-        )
-        if was_clipped:
-            clipped_steps += 1
+        with range_context("train/gradient_clipping"):
+            gradient_norm, was_clipped = clip_gradients(
+                model.parameters(),
+                config.gradient_limit,
+                synchronize=collect_metrics,
+            )
+        if collect_metrics:
+            metrics_samples += 1
+            if was_clipped is True:
+                clipped_steps += 1
 
-        loss_val = loss.item()
-        pre_step_ok = math.isfinite(loss_val) and all(
-            p.grad is None or torch.isfinite(p.grad).all()
-            for p in model.parameters()
+        loss_val = loss.item() if collect_metrics else None
+        # gradient_norm is already reduced to a synchronized Python scalar by
+        # clipping, so it doubles as the non-finite-gradient check. Avoid
+        # scanning every parameter from Python (one MPS synchronization per
+        # tensor), scanning weights again, and copying the entire model into a
+        # rollback snapshot on every healthy step.
+        step_healthy = (
+            not collect_metrics
+            or (math.isfinite(loss_val) and math.isfinite(gradient_norm))
         )
-        step_healthy = False
-        if pre_step_ok:
-            optimizer.step()
-            step_healthy = all(torch.isfinite(p).all() for p in model.parameters())
-
         if step_healthy:
-            # Advance the rollback snapshot to these weights.
-            with torch.no_grad():
-                for buf, p in zip(stable_state, model.parameters()):
-                    buf.copy_(p.detach())
-            last_good_loss = loss_val
+            with range_context("train/optimizer"):
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+            if loss_val is not None:
+                last_good_loss = loss_val
         else:
-            # Restore the last healthy weights.
-            with torch.no_grad():
-                for p, buf in zip(model.parameters(), stable_state):
-                    p.copy_(buf)
+            optimizer.zero_grad(set_to_none=True)
             recovered_steps += 1
             if last_good_loss is not None:
                 loss_val = last_good_loss
-            print(f"[stability] step {step}: non-finite loss/grad/weights — rolled back to "
-                  f"last healthy weights (total recovered: {recovered_steps})", flush=True)
+            print(f"[stability] step {step}: non-finite loss/grad — skipped update "
+                  f"(total skipped: {recovered_steps})", flush=True)
 
-        step_state = {
-            "gradient_norm": gradient_norm,
-            "gradient_clipped": int(was_clipped),
-            "gradient_clip_rate": clipped_steps / step,
-        }
+        step_state = None
+        if collect_metrics:
+            step_state = {
+                "gradient_norm": gradient_norm,
+                "gradient_clipped": int(was_clipped),
+                "gradient_clip_rate": clipped_steps / metrics_samples,
+            }
         if step % config.mfu_interval == 0:
             synchronize_accelerator(config.device)
-            t1 = time.time()
+            t1 = time.perf_counter()
             dt = t1 - t0
             t0 = t1
 
@@ -267,27 +428,54 @@ def train(config: TrainingConfig, step_callback=None):
             print(f"MFU: {mfu}")
             step_state["mfu"] = mfu
 
-        if step % config.checkpoint_interval == 0:
-            checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
-        if validation_batch_loader is not None and step % config.validation_interval == 0:
-            validation_loss = calculate_validation_loss(
-                model=model,
-                loader=validation_batch_loader,
+        if step % 100 == 0:
+            # Measure the actual training steps, excluding periodic validation
+            # and checkpoint I/O. Synchronize only at the reporting boundary so
+            # queued MPS optimizer work is included without taxing every step.
+            synchronize_accelerator(config.device)
+            now = time.perf_counter()
+            step_state["avg_step_time_ms"] = (
+                (now - timing_window_started) * 1000.0 / 100
             )
+
+        if step % config.checkpoint_interval == 0:
+            with range_context("train/checkpoint"):
+                checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
+        if validation_batch_loader is not None and step % config.validation_interval == 0:
+            with range_context("train/validation"):
+                validation_loss = calculate_validation_loss(
+                    model=model,
+                    loader=validation_batch_loader,
+                    amp_context=amp_context,
+                )
             step_state["val_loss"] = validation_loss.item()
 
         # loss_val was computed above (and, for a skipped step, set to the last good loss).
-        step_state["loss"] = loss_val
-        try:
-            # perplexity is display-only; a transient loss spike (huge/inf loss)
-            # must never crash the run via math.exp overflow.
-            step_state["perplexity"] = math.exp(loss_val)
-        except (OverflowError, ValueError):
-            step_state["perplexity"] = float("inf")
-        logger.log(step_state=step_state, step=step)
+        if collect_metrics:
+            step_state["loss"] = loss_val
+            try:
+                # perplexity is display-only; a transient loss spike (huge/inf loss)
+                # must never crash the run via math.exp overflow.
+                step_state["perplexity"] = math.exp(loss_val)
+            except (OverflowError, ValueError):
+                step_state["perplexity"] = float("inf")
+            logger.log(step_state=step_state, step=step)
 
-        if step_callback is not None:
-            step_callback(step, step_state)
+            if step_callback is not None:
+                step_callback(step, step_state)
+
+        if step % 100 == 0:
+            timing_window_started = time.perf_counter()
+
+        if profiler is not None:
+            profiler.step()
+            profiler_steps_remaining -= 1
+            if profiler_steps_remaining == 0:
+                profiler.stop()
+                profiler = None
+
+    if profiler is not None:
+        profiler.stop()
 
     return
 
@@ -365,17 +553,36 @@ class BatchLoader:
         batch_size: int,
         context_length: int,
         device: torch.device,
+        num_batches: int | None = None,
     ):
         self.file = numpy.load(file_path, mmap_mode="r")
         self.batch_size = batch_size
         self.context_length = context_length
         self.device = device
+        self.preloaded_batches = None
+        self.batch_index = 0
+        if num_batches:
+            max_index = len(self.file) - context_length - 1
+            starts = numpy.random.randint(
+                0, max_index + 1, size=(num_batches, batch_size)
+            )
+            offsets = numpy.arange(context_length + 1)
+            windows = numpy.asarray(
+                self.file[starts[:, :, None] + offsets[None, None, :]]
+            )
+            self.preloaded_batches = torch.from_numpy(windows).to(
+                device=device, dtype=torch.long
+            )
 
     def load_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.preloaded_batches is not None:
+            batch = self.preloaded_batches[self.batch_index]
+            self.batch_index += 1
+            return batch[:, :-1], batch[:, 1:]
         return load_batch(self.file, batch_size=self.batch_size, context_length=self.context_length, device=self.device)
 
 
-def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
+def calculate_validation_loss(model: nn.Module, loader: BatchLoader, amp_context=nullcontext) -> float:
     model.eval()
     with torch.no_grad():
         # One random batch is far too noisy to select checkpoints. Average enough
@@ -383,8 +590,9 @@ def calculate_validation_loss(model: nn.Module, loader: BatchLoader) -> float:
         losses = []
         for _ in range(16):
             validation_data, validation_label = loader.load_batch()
-            validation_output = model(validation_data)
-            losses.append(cross_entropy(validation_output, validation_label))
+            with amp_context():
+                validation_output = model(validation_data)
+                losses.append(cross_entropy(validation_output, validation_label))
         return torch.stack(losses).mean()
 
 
@@ -406,7 +614,10 @@ def main():
     parser.add_argument("--epsilon", type=float, default=1e-5, help="Epsilon cosntant for AdamW Optimization")
     parser.add_argument("--training-steps", type=int, default=10_000, help="Number of training iterations to run")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Steps before specified learning rate reached")
+    parser.add_argument("--lr-schedule", choices=("cosine", "constant"), default="cosine", help="Learning-rate schedule after warmup")
     parser.add_argument("--gradient-limit", type=float, default=1.0, help="L2 norm above which gradients will be clipped")
+    parser.add_argument("--metrics-interval", type=int, default=1, help="Synchronize and report scalar metrics every n steps")
+    parser.add_argument("--preload-batches", action="store_true", help="Stage all plain-loader batches on the accelerator before training")
     parser.add_argument("--training-data-path", type=str, required=True, help="Path to training data (.npy)")
     parser.add_argument("--validation-data-path", type=str, required=False, help="Path to validation data (.npy)")
     parser.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every n training steps")
@@ -414,6 +625,13 @@ def main():
     parser.add_argument("--mfu-interval", type=int, default=100, help="Interval at which to calculate MFU")
     parser.add_argument("--device", type=str, default="mps", help="Device on which to train model")
     parser.add_argument("--dtype", type=torch.dtype, default=torch.float32, help="Data type for model weights")
+    parser.add_argument("--mixed-precision", dest="use_mixed_precision", action="store_true", help="Use mixed precision (BF16 on MPS/CPU, FP16 with loss scaling on CUDA)")
+    parser.add_argument("--profile-dir", type=str, default=None, help="Write a source-aware PyTorch trace of this exact training loop to this directory")
+    parser.add_argument("--profile-trigger-file", type=str, default=None, help="Start a live profile when this file appears; usable repeatedly")
+    parser.add_argument("--profile-wait-steps", type=int, default=5, help="Unrecorded profiler steps before warmup")
+    parser.add_argument("--profile-warmup-steps", type=int, default=5, help="Profiler warmup steps")
+    parser.add_argument("--profile-active-steps", type=int, default=20, help="Training steps captured in each profiler trace")
+    parser.add_argument("--seed", type=int, default=None, help="Seed model initialization and batch sampling for paired experiments")
     parser.add_argument("--compile", dest="compile", action="store_true", help="Compile the model before training")
     parser.add_argument("--train-reference", dest="train_reference", action="store_true", help="Train reference model instead")
     parser.add_argument("--run-name", type=str, help="Name of the training run as it will appear in WandB and Tensorboard")
@@ -427,6 +645,7 @@ def main():
     parser.set_defaults(
         train_reference=False,
         compile=False,
+        use_mixed_precision=False,
         disable_wandb=False,
         disable_tensorboard=False,
     )
@@ -449,7 +668,10 @@ def main():
         eps=args.epsilon,
         training_steps=args.training_steps,
         warmup_steps=args.warmup_steps,
+        lr_schedule=args.lr_schedule,
         gradient_limit=args.gradient_limit,
+        metrics_interval=args.metrics_interval,
+        preload_batches=args.preload_batches,
         checkpoint_interval=args.checkpoint_interval,
         validation_interval=args.validation_interval,
         mfu_interval=args.mfu_interval,
@@ -460,6 +682,13 @@ def main():
         checkpoint_resume_path=args.resume_from_checkpoint,
         device=args.device,
         dtype=args.dtype,
+        use_mixed_precision=args.use_mixed_precision,
+        profile_dir=args.profile_dir,
+        profile_trigger_file=args.profile_trigger_file,
+        profile_wait_steps=args.profile_wait_steps,
+        profile_warmup_steps=args.profile_warmup_steps,
+        profile_active_steps=args.profile_active_steps,
+        seed=args.seed,
         compile=args.compile,
         train_reference=args.train_reference,
         run_name=args.run_name,
@@ -484,6 +713,8 @@ def main():
                 f" clipped {step_state['gradient_clipped']}"
                 f" clip_rate {step_state['gradient_clip_rate']:.6f}"
             )
+            if "avg_step_time_ms" in step_state:
+                msg += f" avg_step_ms {step_state['avg_step_time_ms']:.3f}"
             print(msg, flush=True)
 
     train(config=config, step_callback=step_callback)

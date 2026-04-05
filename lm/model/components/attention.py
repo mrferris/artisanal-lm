@@ -7,6 +7,27 @@ from jaxtyping import Float, Int
 from lm.model.components.linear import Linear
 
 
+class _Softmax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, dim, temperature):
+        max_values = torch.max(tensor, dim=dim, keepdim=True)[0]
+        exponentials = tensor.sub(max_values).div_(temperature).exp_()
+        probabilities = exponentials.div_(torch.sum(exponentials, dim=dim, keepdim=True))
+        ctx.dim = dim
+        ctx.temperature = temperature
+        ctx.save_for_backward(probabilities)
+        return probabilities
+
+    @staticmethod
+    def backward(ctx, output_gradient):
+        (probabilities,) = ctx.saved_tensors
+        projection = torch.sum(
+            output_gradient * probabilities, dim=ctx.dim, keepdim=True
+        )
+        input_gradient = probabilities * (output_gradient - projection)
+        return input_gradient / ctx.temperature, None, None
+
+
 class Rope(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None):
         super().__init__()
@@ -26,10 +47,35 @@ class Rope(nn.Module):
 
         self.register_buffer("sin_tensor", sines, persistent=False)
         self.register_buffer("cosin_tensor", cosines, persistent=False)
+        # MPS mixed precision uses BF16 activations. Keep a cached cast of the
+        # immutable tables so every Q/K rotation does not insert FP32↔BF16
+        # conversion kernels.
+        self.register_buffer("sin_tensor_bf16", sines.to(torch.bfloat16), persistent=False)
+        self.register_buffer("cosin_tensor_bf16", cosines.to(torch.bfloat16), persistent=False)
 
     def forward(self, x: Float[torch.Tensor, "... seq_len d_k"], token_positions: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len d_k"]:
-        cosins = self.cosin_tensor[token_positions]
-        sins = self.sin_tensor[token_positions]
+        if x.dtype == torch.bfloat16:
+            cosine_table = self.cosin_tensor_bf16
+            sine_table = self.sin_tensor_bf16
+        else:
+            cosine_table = self.cosin_tensor
+            sine_table = self.sin_tensor
+        if token_positions.ndim == 1 and token_positions.numel() == self.max_seq_len:
+            # Fixed-length training always uses every position in order. A
+            # direct view avoids two MPS advanced-index kernels per RoPE call.
+            cosins = cosine_table
+            sins = sine_table
+        else:
+            # Preserve arbitrary offsets/positions for KV-cached inference.
+            cosins = cosine_table[token_positions]
+            sins = sine_table[token_positions]
+
+        # The normal training path uses one shared 1-D position vector. Add
+        # singleton batch/head dimensions so sine/cosine tables broadcast
+        # instead of being materialized once per batch item and head.
+        while cosins.ndim < x.ndim:
+            cosins = cosins.unsqueeze(0)
+            sins = sins.unsqueeze(0)
 
         x_even = x[..., 0::2]
         x_odd = x[..., 1::2]
@@ -37,26 +83,13 @@ class Rope(nn.Module):
         x_even_rotated = (cosins * x_even) - (sins * x_odd)
         x_odd_rotated = (sins * x_even) + (cosins * x_odd)
 
-        output = torch.zeros_like(x)
-        output[..., 0::2] = x_even_rotated
-        output[..., 1::2] = x_odd_rotated
-
-        return output
+        # Interleave even/odd components without zeros_like plus two strided
+        # CopySlice operations (and their corresponding backward nodes).
+        return torch.stack((x_even_rotated, x_odd_rotated), dim=-1).flatten(-2)
 
 
 def softmax(tensor: Float[torch.Tensor, "..."], dim: int, temperature: float) -> torch.Tensor:
-    # Subtract the maximum for numerical stability
-    max = torch.max(tensor, dim=dim, keepdim=True)[0]
-    stabilized_tensor = tensor - max
-
-    # Get the entire vector exponentiated
-    exponentiated = torch.exp(stabilized_tensor / temperature)
-
-    # Sum all of the vector elements exponentiated
-    sum = torch.sum(exponentiated, dim=dim, keepdim=True)
-
-    # Divide the dim vector by the sums
-    return exponentiated / sum
+    return _Softmax.apply(tensor, dim, temperature)
 
 
 def scaled_dot_product_attention(
@@ -118,7 +151,6 @@ class MultiHeadSelfAttention(nn.Module):
         *batch_dims, seq_len, _ = input.shape
         use_cache = kv_cache is not None
 
-        # Project the input onto the Wq, Wk, and Wv
         Q = self.w_q(input)
         K = self.w_k(input)
         V = self.w_v(input)
@@ -134,23 +166,8 @@ class MultiHeadSelfAttention(nn.Module):
         V = V.transpose(-3, -2)
 
         if self.rope is not None and token_positions is not None:
-            original_q_shape = Q.shape
-            original_k_shape = K.shape
-
-            # Flatten batch and head dimensions for RoPE application
-            Q_flat = Q.reshape(-1, seq_len, self.d_k)
-            K_flat = K.reshape(-1, seq_len, self.d_k)
-
-            # Expand token_positions to match the flattened batch*head dimension
-            pos_expanded = token_positions.unsqueeze(-2)
-            pos_expanded = pos_expanded.expand(*batch_dims, self.num_heads, seq_len)
-            pos_flat = pos_expanded.reshape(-1, seq_len)
-
-            Q_flat = self.rope.forward(Q_flat, pos_flat)
-            K_flat = self.rope.forward(K_flat, pos_flat)
-
-            Q = Q_flat.reshape(original_q_shape)
-            K = K_flat.reshape(original_k_shape)
+            Q = self.rope(Q, token_positions)
+            K = self.rope(K, token_positions)
 
         # Concat cached K/V from prefix if provided (truthy = has actual data)
         if kv_cache:
