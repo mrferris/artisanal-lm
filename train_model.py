@@ -22,7 +22,11 @@ from lm.tokenization.bpe import Tokenizer
 from lm.training.loss.cross_entropy import cross_entropy, cross_entropy_masked
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
-from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
+from lm.training.utils.data_batching import (
+    ConversationBatchLoader,
+    ResponseBatchLoader,
+    load_batch,
+)
 from lm.training.utils.gradient_clipping import clip_gradients
 from lm.training.utils.scheduler import learning_rate_scheduler
 
@@ -100,8 +104,11 @@ class TrainingConfig:
     # Optional second stage: switch a plain pretraining run to conversation-
     # aligned batches with loss on <|Me|> content plus conversation structure.
     finetune_start_step: int | None = None
+    finetune_loader: str = "conversation"
     reaction_loss_weight: int = 1
     emoji_loss_weight: int = 1
+    response_prefix_tokens: int = 0
+    response_prefix_weight: int = 1
 
 
 def fine_tune_token_loss_weights(config: TrainingConfig) -> dict[int, int]:
@@ -202,13 +209,26 @@ def train(config: TrainingConfig, step_callback=None):
                 "--finetune-start-step must be between 1 and training_steps + 1"
             )
         fine_tune_weights = fine_tune_token_loss_weights(config)
-        finetune_data_loader = ConversationBatchLoader(
+        FineTuneLoader = (
+            ResponseBatchLoader
+            if config.finetune_loader == "response"
+            else ConversationBatchLoader
+        )
+        finetune_data_loader = FineTuneLoader(
             file_path=config.training_data_path,
             batch_size=config.batch_size,
             context_length=config.context_length,
             device=config.device,
             seed=config.seed,
             token_loss_weights=fine_tune_weights,
+            **(
+                {
+                    "response_prefix_tokens": config.response_prefix_tokens,
+                    "response_prefix_weight": config.response_prefix_weight,
+                }
+                if FineTuneLoader is ResponseBatchLoader
+                else {}
+            ),
         )
 
     # Validation is optional — an embedded run may only have training data.
@@ -220,7 +240,7 @@ def train(config: TrainingConfig, step_callback=None):
             device=config.device,
         )
         masked_validation_batch_loader = (
-            ConversationBatchLoader(
+            ResponseBatchLoader(
                 file_path=config.validation_data_path,
                 batch_size=config.batch_size,
                 context_length=config.context_length,
@@ -614,6 +634,28 @@ def vocab_fingerprint(vocab_path, vocab_size):
     return meta
 
 
+def validate_encoded_vocab(training_data_path, vocab_path):
+    """Fail before training when encoded tokens and tokenizer do not match."""
+    if not vocab_path:
+        return
+    fingerprint_path = os.path.join(
+        os.path.dirname(os.path.abspath(training_data_path)),
+        "vocab_sha.txt",
+    )
+    if not os.path.exists(fingerprint_path):
+        return
+    with open(fingerprint_path) as fingerprint_file:
+        expected = fingerprint_file.read().strip()
+    with open(vocab_path, "rb") as vocab_file:
+        actual = hashlib.sha256(vocab_file.read()).hexdigest()
+    if actual != expected:
+        raise ValueError(
+            "Tokenizer mismatch: training data was encoded with vocab "
+            f"{expected[:12]}..., but --vocab-path is {actual[:12]}.... "
+            "Use the vocab_sha.txt-matched tokenizer or rebuild the encoded data."
+        )
+
+
 class Checkpointer:
     def __init__(self, meta=None):
         self.start_time = datetime.now().strftime("%-m-%-d-%y_%H:%M")
@@ -754,8 +796,11 @@ def main():
     parser.add_argument("--progress-stdout", dest="progress_stdout", action="store_true", help="Print a machine-readable 'PROGRESS step N total loss L' line each step for embedders to parse")
     parser.add_argument("--loader", type=str, default="conversation", choices=["conversation", "plain"], help="Batch loader: 'conversation' (conversation-aligned, padded) or 'plain' (uniform random fixed-length windows)")
     parser.add_argument("--finetune-start-step", type=int, default=None, help="At this step, switch a plain-loader run to conversation batches and selective Me-content plus structural loss")
+    parser.add_argument("--finetune-loader", choices=("conversation", "response"), default="conversation", help="Fine-tuning sampler: arbitrary conversation chunks or response-anchored windows")
     parser.add_argument("--reaction-loss-weight", type=int, default=1, help="Fine-tuning loss weight for Me reaction tokens (IDs 4-9)")
     parser.add_argument("--emoji-loss-weight", type=int, default=1, help="Fine-tuning loss weight for Me emoji special tokens")
+    parser.add_argument("--response-prefix-tokens", type=int, default=0, help="Number of initial content tokens after each Me marker to emphasize with ResponseBatchLoader")
+    parser.add_argument("--response-prefix-weight", type=int, default=1, help="Loss multiplier for emphasized response-prefix tokens")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -765,6 +810,7 @@ def main():
     )
 
     args = parser.parse_args()
+    validate_encoded_vocab(args.training_data_path, args.vocab_path)
 
     config = TrainingConfig(
         batch_size=args.batch_size,
@@ -810,8 +856,11 @@ def main():
         disable_tensorboard=args.disable_tensorboard,
         loader=args.loader,
         finetune_start_step=args.finetune_start_step,
+        finetune_loader=args.finetune_loader,
         reaction_loss_weight=args.reaction_loss_weight,
         emoji_loss_weight=args.emoji_loss_weight,
+        response_prefix_tokens=args.response_prefix_tokens,
+        response_prefix_weight=args.response_prefix_weight,
     )
 
     print(f"Training with config: {config}")
