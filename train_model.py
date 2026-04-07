@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 import math
 import os
 import time
@@ -18,7 +19,7 @@ from lm.model.model import TransformerLM
 from lm.performance.reference.model import BasicsTransformerLM as ReferenceTransformerLM
 from lm.performance.utils import estimate_mfu, synchronize_accelerator
 from lm.tokenization.bpe import Tokenizer
-from lm.training.loss.cross_entropy import cross_entropy
+from lm.training.loss.cross_entropy import cross_entropy, cross_entropy_masked
 from lm.training.optimization.adamw import AdamW
 from lm.training.utils.checkpointing import load_checkpoint, save_checkpoint
 from lm.training.utils.data_batching import ConversationBatchLoader, load_batch
@@ -96,6 +97,33 @@ class TrainingConfig:
     # Which batch loader to use: "conversation" (conversation-aligned, padded) or
     # "plain" (uniform random fixed-length windows over the token stream).
     loader: str = "conversation"
+    # Optional second stage: switch a plain pretraining run to conversation-
+    # aligned batches with loss on <|Me|> content plus conversation structure.
+    finetune_start_step: int | None = None
+    reaction_loss_weight: int = 1
+    emoji_loss_weight: int = 1
+
+
+def fine_tune_token_loss_weights(config: TrainingConfig) -> dict[int, int]:
+    """Build optional emphasis weights for rare Me reaction/emoji targets."""
+    weights = {
+        token_id: config.reaction_loss_weight
+        for token_id in range(4, 10)
+        if config.reaction_loss_weight != 1
+    }
+    if config.emoji_loss_weight == 1 or not config.vocab_path:
+        return weights
+
+    with open(config.vocab_path) as vocab_file:
+        vocab = json.load(vocab_file)
+    # IDs 0:10 are core/reaction tokens. Emoji specials follow them until
+    # the first one-byte base token, matching MikeGPT's tokenizer builder.
+    for token_id in range(10, config.vocab_size):
+        encoded = vocab.get(str(token_id))
+        if encoded is None or len(bytes.fromhex(encoded)) == 1:
+            break
+        weights[token_id] = config.emoji_loss_weight
+    return weights
 
 
 def train(config: TrainingConfig, step_callback=None):
@@ -165,6 +193,23 @@ def train(config: TrainingConfig, step_callback=None):
     if LoaderClass is BatchLoader and config.preload_batches:
         loader_kwargs["num_batches"] = config.training_steps
     training_data_loader = LoaderClass(**loader_kwargs)
+    finetune_data_loader = None
+    if config.finetune_start_step is not None:
+        if config.loader != "plain":
+            raise ValueError("--finetune-start-step requires --loader plain")
+        if not 1 <= config.finetune_start_step <= config.training_steps + 1:
+            raise ValueError(
+                "--finetune-start-step must be between 1 and training_steps + 1"
+            )
+        fine_tune_weights = fine_tune_token_loss_weights(config)
+        finetune_data_loader = ConversationBatchLoader(
+            file_path=config.training_data_path,
+            batch_size=config.batch_size,
+            context_length=config.context_length,
+            device=config.device,
+            seed=config.seed,
+            token_loss_weights=fine_tune_weights,
+        )
 
     # Validation is optional — an embedded run may only have training data.
     if config.validation_data_path:
@@ -174,14 +219,38 @@ def train(config: TrainingConfig, step_callback=None):
             context_length=config.context_length,
             device=config.device,
         )
+        masked_validation_batch_loader = (
+            ConversationBatchLoader(
+                file_path=config.validation_data_path,
+                batch_size=config.batch_size,
+                context_length=config.context_length,
+                device=config.device,
+                seed=None if config.seed is None else config.seed + 1,
+                token_loss_weights=fine_tune_weights,
+            )
+            if finetune_data_loader is not None
+            else None
+        )
     else:
         validation_batch_loader = None
+        masked_validation_batch_loader = None
 
     # Logged and used for MFU calculations.
     param_count = model.param_count()[1]
 
     logger = TrainingLogger(config=config, param_count=param_count)
-    checkpointer = Checkpointer(meta=vocab_fingerprint(config.vocab_path, config.vocab_size))
+    checkpoint_meta = vocab_fingerprint(config.vocab_path, config.vocab_size)
+    checkpoint_meta.update(
+        {
+            "d_model": config.d_model,
+            "d_ff": config.d_ff,
+            "num_layers": config.num_layers,
+            "num_heads": config.num_heads,
+            "context_length": config.context_length,
+            "rope_theta": config.rope_theta,
+        }
+    )
+    checkpointer = Checkpointer(meta=checkpoint_meta)
     if config.checkpoint_resume_path:
         checkpointer.load_checkpoint(
             model=model,
@@ -339,9 +408,19 @@ def train(config: TrainingConfig, step_callback=None):
             )
         optimizer.set_learning_rate(lr)
 
-        # Get a batch of data using the data loader
+        fine_tuning = (
+            finetune_data_loader is not None
+            and step >= config.finetune_start_step
+        )
+
+        # Get a batch of data using the active phase's loader.
         with range_context("train/data_loader"):
-            train, label = training_data_loader.load_batch()
+            active_loader = (
+                finetune_data_loader if fine_tuning else training_data_loader
+            )
+            loaded_batch = active_loader.load_batch()
+            train, label = loaded_batch[:2]
+            loss_mask = loaded_batch[2] if len(loaded_batch) == 3 else None
 
         # Print de-tokenized first sequence of the batch
         if tokenizer is not None:
@@ -354,7 +433,11 @@ def train(config: TrainingConfig, step_callback=None):
                 output = model(train)
         with range_context("train/loss"):
             with amp_context():
-                loss = cross_entropy(output, label)
+                loss = (
+                    cross_entropy_masked(output, label, train, loss_mask)
+                    if fine_tuning or config.loader == "conversation"
+                    else cross_entropy(output, label)
+                )
 
         # Backpropogate and calculate gradients.
         optimizer.zero_grad(set_to_none=True)
@@ -414,6 +497,7 @@ def train(config: TrainingConfig, step_callback=None):
                 "gradient_norm": gradient_norm,
                 "gradient_clipped": int(was_clipped),
                 "gradient_clip_rate": clipped_steps / metrics_samples,
+                "phase": "finetune" if fine_tuning else "pretrain",
             }
         if step % config.mfu_interval == 0:
             synchronize_accelerator(config.device)
@@ -449,6 +533,15 @@ def train(config: TrainingConfig, step_callback=None):
                     amp_context=amp_context,
                 )
             step_state["val_loss"] = validation_loss.item()
+            if masked_validation_batch_loader is not None:
+                with range_context("train/masked_validation"):
+                    masked_validation_loss = calculate_validation_loss(
+                        model=model,
+                        loader=masked_validation_batch_loader,
+                        amp_context=amp_context,
+                        masked=True,
+                    )
+                step_state["masked_val_loss"] = masked_validation_loss.item()
 
         # loss_val was computed above (and, for a skipped step, set to the last good loss).
         if collect_metrics:
@@ -582,17 +675,35 @@ class BatchLoader:
         return load_batch(self.file, batch_size=self.batch_size, context_length=self.context_length, device=self.device)
 
 
-def calculate_validation_loss(model: nn.Module, loader: BatchLoader, amp_context=nullcontext) -> float:
+def calculate_validation_loss(
+    model: nn.Module,
+    loader: BatchLoader,
+    amp_context=nullcontext,
+    masked: bool = False,
+) -> float:
     model.eval()
     with torch.no_grad():
         # One random batch is far too noisy to select checkpoints. Average enough
         # batches to cover 16 * batch_size contexts at every validation interval.
         losses = []
         for _ in range(16):
-            validation_data, validation_label = loader.load_batch()
+            loaded_batch = loader.load_batch()
+            validation_data, validation_label = loaded_batch[:2]
+            validation_loss_mask = (
+                loaded_batch[2] if len(loaded_batch) == 3 else None
+            )
             with amp_context():
                 validation_output = model(validation_data)
-                losses.append(cross_entropy(validation_output, validation_label))
+                losses.append(
+                    cross_entropy_masked(
+                        validation_output,
+                        validation_label,
+                        validation_data,
+                        validation_loss_mask,
+                    )
+                    if masked
+                    else cross_entropy(validation_output, validation_label)
+                )
         return torch.stack(losses).mean()
 
 
@@ -642,6 +753,9 @@ def main():
     parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path of checkpoint from which to resume training")
     parser.add_argument("--progress-stdout", dest="progress_stdout", action="store_true", help="Print a machine-readable 'PROGRESS step N total loss L' line each step for embedders to parse")
     parser.add_argument("--loader", type=str, default="conversation", choices=["conversation", "plain"], help="Batch loader: 'conversation' (conversation-aligned, padded) or 'plain' (uniform random fixed-length windows)")
+    parser.add_argument("--finetune-start-step", type=int, default=None, help="At this step, switch a plain-loader run to conversation batches and selective Me-content plus structural loss")
+    parser.add_argument("--reaction-loss-weight", type=int, default=1, help="Fine-tuning loss weight for Me reaction tokens (IDs 4-9)")
+    parser.add_argument("--emoji-loss-weight", type=int, default=1, help="Fine-tuning loss weight for Me emoji special tokens")
     parser.set_defaults(
         train_reference=False,
         compile=False,
@@ -695,6 +809,9 @@ def main():
         disable_wandb=args.disable_wandb,
         disable_tensorboard=args.disable_tensorboard,
         loader=args.loader,
+        finetune_start_step=args.finetune_start_step,
+        reaction_loss_weight=args.reaction_loss_weight,
+        emoji_loss_weight=args.emoji_loss_weight,
     )
 
     print(f"Training with config: {config}")
@@ -715,6 +832,9 @@ def main():
             )
             if "avg_step_time_ms" in step_state:
                 msg += f" avg_step_ms {step_state['avg_step_time_ms']:.3f}"
+            if "masked_val_loss" in step_state:
+                msg += f" masked_val {step_state['masked_val_loss']:.6f}"
+            msg += f" phase {step_state.get('phase', 'pretrain')}"
             print(msg, flush=True)
 
     train(config=config, step_callback=step_callback)

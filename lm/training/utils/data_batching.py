@@ -38,11 +38,21 @@ def load_batch(
 
 
 class ConversationBatchLoader:
-    def __init__(self, file_path: str, batch_size: int, context_length: int, device: torch.device):
+    def __init__(
+        self,
+        file_path: str,
+        batch_size: int,
+        context_length: int,
+        device: torch.device,
+        seed: int | None = None,
+        token_loss_weights: dict[int, int] | None = None,
+    ):
         self.tokens = np.load(file_path, mmap_mode="r")
         self.batch_size = batch_size
         self.context_length = context_length
         self.device = device
+        self.rng = np.random.default_rng(seed)
+        self.token_loss_weights = token_loss_weights or {}
 
         # Define special tokens
         self.END_TOKEN = 0
@@ -52,6 +62,82 @@ class ConversationBatchLoader:
 
         # Precompute conversation chunks for speed
         self.chunks = self._compute_chunks()
+        self.chunk_lengths = np.asarray(
+            [length for _, length in self.chunks], dtype=np.int32
+        )
+        self.packed_chunks = self._pack_chunks()
+
+    def _pack_chunks(self) -> NDArray:
+        """Materialize input, shifted target, and selective loss weights once."""
+        packed = np.full(
+            (3, len(self.chunks), self.context_length),
+            self.END_TOKEN,
+            dtype=self.tokens.dtype,
+        )
+        for row, (start_idx, length) in enumerate(self.chunks):
+            chunk = self.tokens[start_idx : start_idx + length]
+            packed[0, row, :length] = chunk
+            # An over-long message can be sliced into continuation chunks that
+            # begin with content rather than a role marker. Recover the role
+            # immediately preceding that slice so its content is not silently
+            # omitted from the Me-only objective.
+            active_speaker = None
+            if int(chunk[0]) not in (
+                self.END_TOKEN,
+                self.ME_TOKEN,
+                self.THEM_TOKEN,
+                self.CONVERSATION_START_TOKEN,
+            ):
+                previous = start_idx - 1
+                while previous >= 0:
+                    token = int(self.tokens[previous])
+                    if token in (self.ME_TOKEN, self.THEM_TOKEN):
+                        active_speaker = token
+                        break
+                    if token in (
+                        self.END_TOKEN,
+                        self.CONVERSATION_START_TOKEN,
+                    ):
+                        break
+                    previous -= 1
+            for position in range(length):
+                input_token = int(chunk[position])
+                if input_token == self.ME_TOKEN:
+                    active_speaker = self.ME_TOKEN
+                elif input_token == self.THEM_TOKEN:
+                    active_speaker = self.THEM_TOKEN
+                elif input_token in (
+                    self.END_TOKEN,
+                    self.CONVERSATION_START_TOKEN,
+                ):
+                    active_speaker = None
+
+                # Use the real following token even at a chunk boundary. The
+                # former synthetic EOT target made every capacity split look
+                # like a conversation ending once structural loss was enabled.
+                next_position = start_idx + position + 1
+                target_token = (
+                    int(self.tokens[next_position])
+                    if next_position < len(self.tokens)
+                    else self.END_TOKEN
+                )
+                packed[1, row, position] = target_token
+
+                target_is_structure = target_token in (
+                    self.ME_TOKEN,
+                    self.THEM_TOKEN,
+                    self.END_TOKEN,
+                )
+                target_is_me_content = (
+                    active_speaker == self.ME_TOKEN
+                    and not target_is_structure
+                    and target_token != self.CONVERSATION_START_TOKEN
+                )
+                if target_is_structure or target_is_me_content:
+                    packed[2, row, position] = self.token_loss_weights.get(
+                        target_token, 1
+                    )
+        return packed
 
     def _compute_chunks(self) -> list[tuple[int, int]]:
         """
@@ -140,7 +226,7 @@ class ConversationBatchLoader:
 
         return chunks
 
-    def load_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def load_batch(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Load a batch by randomly sampling from pre-computed conversation chunks.
 
@@ -152,37 +238,13 @@ class ConversationBatchLoader:
             raise ValueError("No conversation chunks found in dataset")
 
         # Randomly sample chunks for this batch
-        chosen_chunk_indices = np.random.choice(len(self.chunks), self.batch_size, replace=True)
+        chosen_chunk_indices = self.rng.choice(
+            len(self.chunks), self.batch_size, replace=True
+        )
 
-        batch_sequences = []
-        batch_labels = []
-
-        for chunk_idx in chosen_chunk_indices:
-            start_idx, length = self.chunks[chunk_idx]
-
-            # Extract the chunk from the token array
-            chunk_tokens = self.tokens[start_idx : start_idx + length]
-
-            # Convert to tensor
-            seq = torch.from_numpy(chunk_tokens.copy()).to(self.device, dtype=torch.long)
-
-            # Labels are shifted by 1 (predict next token)
-            label = torch.zeros_like(seq)
-            label[:-1] = seq[1:]
-            label[-1] = self.END_TOKEN
-
-            batch_sequences.append(seq)
-            batch_labels.append(label)
-
-        # Pad sequences to the same length (the max length in this batch)
-        lengths = [len(seq) for seq in batch_sequences]
-        max_len = max(lengths)
-
-        padded_seqs = torch.full((self.batch_size, max_len), self.END_TOKEN, dtype=torch.long, device=self.device)
-        padded_labels = torch.full((self.batch_size, max_len), self.END_TOKEN, dtype=torch.long, device=self.device)
-
-        for i, (seq, label) in enumerate(zip(batch_sequences, batch_labels)):
-            padded_seqs[i, : lengths[i]] = seq
-            padded_labels[i, : lengths[i]] = label
-
-        return padded_seqs, padded_labels
+        max_len = int(self.chunk_lengths[chosen_chunk_indices].max())
+        packed = np.ascontiguousarray(
+            self.packed_chunks[:, chosen_chunk_indices, :max_len]
+        )
+        batch = torch.from_numpy(packed).to(device=self.device, dtype=torch.long)
+        return batch[0], batch[1], batch[2]

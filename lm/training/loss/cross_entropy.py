@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 from jaxtyping import Float, Int
 
 
@@ -21,6 +20,29 @@ class _CrossEntropy(torch.autograd.Function):
         return gradient.to(logits.dtype), None
 
 
+class _MaskedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, targets, mask):
+        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+        target_logit = logits.gather(dim=-1, index=targets.unsqueeze(-1))
+        denominator = mask.sum().clamp(min=1)
+        ctx.save_for_backward(logits, logsumexp, targets, mask, denominator)
+        return ((logsumexp - target_logit).squeeze(-1) * mask).sum() / denominator
+
+    @staticmethod
+    def backward(ctx, output_gradient):
+        logits, logsumexp, targets, mask, denominator = ctx.saved_tensors
+        gradient = torch.exp(logits - logsumexp)
+        target_delta = torch.full_like(
+            targets.unsqueeze(-1), -1, dtype=gradient.dtype
+        )
+        gradient.scatter_add_(-1, targets.unsqueeze(-1), target_delta)
+        gradient.mul_(
+            (output_gradient / denominator) * mask.unsqueeze(-1)
+        )
+        return gradient.to(logits.dtype), None, None
+
+
 def cross_entropy(logits: Float[torch.Tensor, "batch_size vocab_size"], targets: Int[torch.Tensor, " batch_size"]) -> Float[torch.Tensor, ""]:
     """
     loss = -log (exp (o) / sum exp (a))
@@ -35,38 +57,50 @@ def cross_entropy_masked(
     logits: torch.Tensor,
     targets: torch.Tensor,
     inputs: torch.Tensor,
-    lengths: list[int] | None = None,
+    loss_mask: torch.Tensor | None = None,
     me_token_id: int = 1,
     them_token_id: int = 2,
-    eot_token_id: int | None = 0,
+    eot_token_id: int = 0,
+    conversation_start_token_id: int = 3,
 ):
     """
-    Masked CE for <|Me|> spans, optionally ignoring padded tokens.
+    Cross-entropy for content inside <|Me|> spans and all structural targets.
+
+    Speaker state is determined by the most recent role marker. This works for
+    arbitrary runs such as Me, Me, Them; it does not assume speakers alternate.
+    Speaker markers and end-of-text remain supervised so fine-tuning cannot
+    teach the model to produce an unterminated Me turn. A loader-supplied mask
+    may contain integer weights rather than only booleans, allowing rare Me
+    reactions and emojis to receive additional emphasis.
     """
-    B, T, V = logits.shape
-    device = logits.device
+    if loss_mask is None:
+        # Reference path used by CPU tests and callers without a conversation
+        # loader. MPS callers receive the precomputed mask from the loader
+        # because MPS does not implement cummax.
+        _, T, _ = logits.shape
+        device = logits.device
+        positions = torch.arange(1, T + 1, device=device).unsqueeze(0)
+        last_me = torch.where(
+            inputs == me_token_id, positions, 0
+        ).cummax(dim=1).values
+        last_them = torch.where(
+            inputs == them_token_id, positions, 0
+        ).cummax(dim=1).values
+        last_reset = torch.where(
+            (inputs == eot_token_id)
+            | (inputs == conversation_start_token_id),
+            positions,
+            0,
+        ).cummax(dim=1).values
+        me_active = (last_me > last_them) & (last_me > last_reset)
+        target_is_structure = (
+            (targets == me_token_id)
+            | (targets == them_token_id)
+            | (targets == eot_token_id)
+        )
+        target_is_content = ~target_is_structure & (
+            targets != conversation_start_token_id
+        )
+        loss_mask = (me_active & target_is_content) | target_is_structure
 
-    # Speaker-based mask
-    delta = torch.zeros_like(inputs, dtype=torch.int32)
-    delta += (inputs == me_token_id).int()
-    delta -= (inputs == them_token_id).int()
-    me_active = delta.cumsum(dim=1) > 0  # [B, T]
-
-    if eot_token_id is not None:
-        seen_eot = (inputs == eot_token_id).int().cumsum(dim=1) > 0
-        me_active = me_active & (~seen_eot)
-
-    # Length-based mask (to ignore padding)
-    if lengths is not None:
-        len_mask = torch.arange(T, device=device).unsqueeze(0) < torch.tensor(lengths, device=device).unsqueeze(1)
-        me_active = me_active & len_mask
-
-    per_token_ce = F.cross_entropy(
-        logits.transpose(1, 2),  # [B, V, T]
-        targets,
-        reduction="none",
-    )
-
-    masked = per_token_ce * me_active
-    denom = me_active.sum().clamp(min=1)
-    return masked.sum() / denom
+    return _MaskedCrossEntropy.apply(logits, targets, loss_mask)

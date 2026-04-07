@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from .adapters import run_cross_entropy, run_gradient_clipping, run_softmax
+from lm.training.loss.cross_entropy import cross_entropy_masked
 from lm.training.utils.gradient_clipping import clip_gradients
 
 
@@ -79,6 +80,40 @@ def test_cross_entropy_backward_matches_pytorch():
     F.cross_entropy(expected_logits, targets).backward()
 
     torch.testing.assert_close(actual_logits.grad, expected_logits.grad)
+
+
+def test_masked_cross_entropy_uses_most_recent_speaker_not_alternation():
+    # ConversationStart, Me:a, Me:b, Them:c, Them:d, Me:e, EOT.
+    # Consecutive same-speaker messages are intentional.
+    sequence = torch.tensor([[3, 1, 4, 1, 5, 2, 6, 2, 7, 1, 8, 0]])
+    inputs, targets = sequence[:, :-1], sequence[:, 1:]
+    logits = torch.randn(1, inputs.shape[1], 12, requires_grad=True)
+    expected_logits = logits.detach().clone().requires_grad_(True)
+
+    actual = cross_entropy_masked(logits, targets, inputs)
+    # Me content a, b, e is selected, as are all role/EOT targets so the
+    # fine-tuned model still learns turn boundaries. Them content is excluded.
+    selected = torch.tensor([0, 1, 2, 3, 4, 6, 8, 9, 10])
+    expected = F.cross_entropy(
+        expected_logits[0, selected],
+        targets[0, selected],
+    )
+
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(logits.grad, expected_logits.grad)
+
+
+def test_masked_cross_entropy_without_me_or_structure_is_differentiable_zero():
+    inputs = torch.tensor([[2, 4, 5]])
+    targets = torch.tensor([[4, 5, 6]])
+    logits = torch.randn(1, 3, 8, requires_grad=True)
+
+    loss = cross_entropy_masked(logits, targets, inputs)
+    assert loss.item() == 0
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
 
 
 def test_gradient_clipping():
