@@ -86,6 +86,7 @@ class TrainingConfig:
     disable_wandb: bool
     disable_tensorboard: bool
     run_name: str
+    suppress_samples: bool = False
 
     # Mixed precision training
     use_mixed_precision: bool = False
@@ -198,7 +199,13 @@ def train(config: TrainingConfig, step_callback=None):
         "device": config.device,
     }
     if LoaderClass is BatchLoader and config.preload_batches:
-        loader_kwargs["num_batches"] = config.training_steps
+        # In a two-stage run, only stage the plain-loader batches that will
+        # actually be consumed before the response fine-tune begins.
+        loader_kwargs["num_batches"] = (
+            min(config.training_steps, config.finetune_start_step - 1)
+            if config.finetune_start_step is not None
+            else config.training_steps
+        )
     training_data_loader = LoaderClass(**loader_kwargs)
     finetune_data_loader = None
     if config.finetune_start_step is not None:
@@ -443,7 +450,7 @@ def train(config: TrainingConfig, step_callback=None):
             loss_mask = loaded_batch[2] if len(loaded_batch) == 3 else None
 
         # Print de-tokenized first sequence of the batch
-        if tokenizer is not None:
+        if tokenizer is not None and not config.suppress_samples:
             first_sequence_ids = train[0].tolist()
             decoded_text = tokenizer.decode(first_sequence_ids)
             tqdm.write(f"Step {step} sample: {decoded_text}")
@@ -546,14 +553,9 @@ def train(config: TrainingConfig, step_callback=None):
             with range_context("train/checkpoint"):
                 checkpointer.save_checkpoint(model, optimizer, step, config.run_name)
         if validation_batch_loader is not None and step % config.validation_interval == 0:
-            with range_context("train/validation"):
-                validation_loss = calculate_validation_loss(
-                    model=model,
-                    loader=validation_batch_loader,
-                    amp_context=amp_context,
-                )
-            step_state["val_loss"] = validation_loss.item()
-            if masked_validation_batch_loader is not None:
+            # Validate against the objective currently being optimized: full
+            # next-token CE during pretraining, then response-only masked CE.
+            if fine_tuning and masked_validation_batch_loader is not None:
                 with range_context("train/masked_validation"):
                     masked_validation_loss = calculate_validation_loss(
                         model=model,
@@ -562,6 +564,14 @@ def train(config: TrainingConfig, step_callback=None):
                         masked=True,
                     )
                 step_state["masked_val_loss"] = masked_validation_loss.item()
+            else:
+                with range_context("train/validation"):
+                    validation_loss = calculate_validation_loss(
+                        model=model,
+                        loader=validation_batch_loader,
+                        amp_context=amp_context,
+                    )
+                step_state["val_loss"] = validation_loss.item()
 
         # loss_val was computed above (and, for a skipped step, set to the last good loss).
         if collect_metrics:
@@ -725,8 +735,60 @@ def calculate_validation_loss(
 ) -> float:
     model.eval()
     with torch.no_grad():
-        # One random batch is far too noisy to select checkpoints. Average enough
-        # batches to cover 16 * batch_size contexts at every validation interval.
+        # Plain-LM validation is deterministic and exhaustive: partition the
+        # held-out token stream into non-overlapping context-length sequences,
+        # and score every next-token target exactly once. Batching those
+        # sequences keeps this much cheaper than sampling overlapping windows.
+        if type(loader) is BatchLoader and not masked:
+            token_count = len(loader.file)
+            target_count = token_count - 1
+            if target_count < 1:
+                raise ValueError("Validation data must contain at least two tokens")
+
+            context_length = loader.context_length
+            complete_sequences = target_count // context_length
+            total_loss = torch.zeros((), device=loader.device, dtype=torch.float32)
+            offsets = numpy.arange(context_length + 1)
+
+            for sequence_start in range(0, complete_sequences, loader.batch_size):
+                sequence_end = min(
+                    complete_sequences,
+                    sequence_start + loader.batch_size,
+                )
+                starts = (
+                    numpy.arange(sequence_start, sequence_end) * context_length
+                )
+                windows = numpy.asarray(
+                    loader.file[starts[:, None] + offsets[None, :]]
+                )
+                batch = torch.from_numpy(windows).to(
+                    device=loader.device,
+                    dtype=torch.long,
+                )
+                with amp_context():
+                    batch_loss = cross_entropy(model(batch[:, :-1]), batch[:, 1:])
+                predictions = batch[:, 1:].numel()
+                total_loss += batch_loss.float() * predictions
+
+            remainder = target_count - complete_sequences * context_length
+            if remainder:
+                start = complete_sequences * context_length
+                window = numpy.asarray(
+                    loader.file[start : start + remainder + 1]
+                ).copy()
+                batch = torch.from_numpy(window).to(
+                    device=loader.device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                with amp_context():
+                    batch_loss = cross_entropy(model(batch[:, :-1]), batch[:, 1:])
+                total_loss += batch_loss.float() * remainder
+
+            return total_loss / target_count
+
+        # Selective conversation/response validation retains its loader-defined
+        # sampling semantics. It is not used by the current pretraining-only
+        # YouGPT run.
         losses = []
         for _ in range(16):
             loaded_batch = loader.load_batch()
@@ -794,6 +856,7 @@ def main():
     parser.add_argument("--merges-path", type=str, default=None, help="Path to .pkl merge file for example training sequences")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path of checkpoint from which to resume training")
     parser.add_argument("--progress-stdout", dest="progress_stdout", action="store_true", help="Print a machine-readable 'PROGRESS step N total loss L' line each step for embedders to parse")
+    parser.add_argument("--suppress-samples", action="store_true", help="Do not print decoded training examples")
     parser.add_argument("--loader", type=str, default="conversation", choices=["conversation", "plain"], help="Batch loader: 'conversation' (conversation-aligned, padded) or 'plain' (uniform random fixed-length windows)")
     parser.add_argument("--finetune-start-step", type=int, default=None, help="At this step, switch a plain-loader run to conversation batches and selective Me-content plus structural loss")
     parser.add_argument("--finetune-loader", choices=("conversation", "response"), default="conversation", help="Fine-tuning sampler: arbitrary conversation chunks or response-anchored windows")
@@ -852,6 +915,7 @@ def main():
         compile=args.compile,
         train_reference=args.train_reference,
         run_name=args.run_name,
+        suppress_samples=args.suppress_samples,
         disable_wandb=args.disable_wandb,
         disable_tensorboard=args.disable_tensorboard,
         loader=args.loader,
