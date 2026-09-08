@@ -304,7 +304,9 @@ class TrainableModel:
     ) -> dict:
         """
         Executes GRPO training loop on a group of (prompt, response, reward) tuples,
-        continuing until the model's KL divergence from its pre-training state reaches target_kl.
+        continuing until the response-prediction KL from the policy at the start
+        of this update reaches target_kl. This is a stopping threshold, not a
+        hard upper bound: the final optimizer step can overshoot it.
 
         Args:
             prompt: List of token IDs for the prompt.
@@ -336,12 +338,6 @@ class TrainableModel:
 
         # Build full sequences for KL computation
         full_sequences = torch.cat((prompt_tensor, response_tensor), dim=1)
-        seq_len = full_sequences.shape[1]
-
-        # Build response position mask (excludes prompt and padding)
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)
-        response_ends = prompt_len + response_lengths
-        response_position_mask = (positions >= prompt_len) & (positions < response_ends.unsqueeze(1))
 
         # Calculate advantages: mean-subtracted rewards
         rewards_tensor = torch.tensor(rewards, dtype=torch.float, device=device)
@@ -356,7 +352,10 @@ class TrainableModel:
                 response_tensor,
                 response_lengths,
             )
-            before_logits = self.model(full_sequences)
+            # Logit j predicts token j+1. Reuse the policy loss's mask so KL
+            # includes the first response prediction and excludes prompt,
+            # padding, and the prediction after the final response token.
+            before_logits = self.model(full_sequences)[:, :-1]
             before_log_probs_full = torch.log_softmax(before_logits, dim=-1)
             before_probs_full = torch.exp(before_log_probs_full)
 
@@ -397,15 +396,15 @@ class TrainableModel:
             losses.append(loss.item())
             step += 1
 
-            # Compute KL divergence from pre-training distribution
+            # Compute KL(old || current) over response-predicting positions.
             with torch.no_grad():
-                after_logits = self.model(full_sequences)
+                after_logits = self.model(full_sequences)[:, :-1]
                 after_log_probs_full = torch.log_softmax(after_logits, dim=-1)
                 kl_per_position = (
                     before_probs_full * (before_log_probs_full - after_log_probs_full)
                 ).sum(dim=-1)
-                masked_kl = kl_per_position * response_position_mask
-                kl = masked_kl.sum() / response_position_mask.sum().clamp(min=1)
+                masked_kl = kl_per_position * response_mask
+                kl = masked_kl.sum() / response_mask.sum().clamp(min=1)
                 kl = kl.item()
 
             kl_values.append(kl)
