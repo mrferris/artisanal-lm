@@ -1,7 +1,7 @@
 import numpy
 import torch
 
-from train_model import BatchLoader, calculate_validation_loss
+from lm.train_model import BatchLoader, calculate_validation_loss
 from lm.training.utils.data_batching import (
     ConversationBatchLoader,
     ResponseBatchLoader,
